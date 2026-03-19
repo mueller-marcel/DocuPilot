@@ -1,3 +1,6 @@
 <Solution>
+  <Folder Name="/Solution Items/">
+    <File Path=".editorconfig" />
+  </Folder>
   <Project Path="src/DocuPilot/DocuPilot.csproj" Id="47104c4d-ae45-4992-aca0-bf372c6aae2c" />
 </Solution>
