@@ -1,6 +1,8 @@
-﻿namespace DocuPilot.ViewModels;
+﻿using CommunityToolkit.Mvvm.ComponentModel;
 
-public partial class MainWindowViewModel : ViewModelBase
+namespace DocuPilot.ViewModels;
+
+public partial class MainWindowViewModel : ObservableObject
 {
     public string Greeting { get; } = "Welcome to Avalonia!";
 }
