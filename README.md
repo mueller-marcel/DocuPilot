@@ -1,1 +1,1 @@
-# multimodal-instruction-generator
+# DocuPilot
