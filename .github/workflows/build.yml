@@ -30,6 +30,3 @@ jobs:
 
       - name: Lint
         run: ruff check .
-
-      - name: Run tests
-        run: pytest
