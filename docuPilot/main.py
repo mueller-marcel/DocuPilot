@@ -1,4 +1,4 @@
-from DocuPilot.app import run
+from docuPilot.app import run
 
 if __name__ == "__main__":
     run()
