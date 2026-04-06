@@ -2,7 +2,7 @@
 name = "DocuPilot"
 version = "0.0.1"
 description = "Records the screen, audio and input events to create user manuals"
-requires-python = ">=3.13"
+requires-python = ">=3.14"
 dependencies = []
 
 [project.scripts]
