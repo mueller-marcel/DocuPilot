@@ -1,14 +1,11 @@
 {
   "$schema": "https://docs.renovatebot.com/renovate-schema.json",
   "extends": [
-    "config:best-practices",
-    "helpers:pinGitHubActionDigests"
+    "config:best-practices"
   ],
-  "timezone": "Europe/Berlin",
   "labels": ["dependencies"],
-  "configMigration": true,
-  "prHourlyLimit": 2,
-  "prConcurrentLimit": 5,
+  "prHourlyLimit": 1,
+  "prConcurrentLimit": 3,
   "packageRules": [
     {
       "matchManagers": ["github-actions"],
