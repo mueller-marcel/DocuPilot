@@ -5,6 +5,12 @@ description = "Records the screen, audio and input events to create user manuals
 requires-python = ">=3.14"
 dependencies = []
 
+[project.optional-dependencies]
+dev = [
+  "pytest>=8,<9",
+  "ruff>=0.13,<0.14"
+]
+
 [project.scripts]
 docupilot = "docupilot.main:run"
 
