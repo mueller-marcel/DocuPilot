@@ -1,12 +1,15 @@
-import tkinter as tk
+from PySide6.QtWidgets import QApplication
+import sys
+
+from docuPilot.ui.MainWindow import MainWindow
+
 
 def run():
     """
-    Bootstraps the app and runs it
+    Bootstrap the application and run it
     """
 
-    root = tk.Tk()
-    root.title("DocuPilot")
-    root.geometry("600x400")
-
-    root.mainloop()
+    app = QApplication(sys.argv)
+    window = MainWindow()
+    window.show()
+    return app.exec()
