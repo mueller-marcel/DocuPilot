@@ -1,5 +1,3 @@
-from __future__ import annotations
-
 from PySide6.QtWidgets import QMainWindow, QVBoxLayout, QWidget
 
 from docuPilot.ui.widgets.ScreenSelectorWidget import ScreenSelectorWidget
