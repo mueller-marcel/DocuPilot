@@ -1,8 +1,8 @@
 from PySide6.QtCore import Signal
 from PySide6.QtWidgets import QApplication, QWidget
 
-from docuPilot.ui.widgets.DeviceSelectorWidget import DeviceSelectorWidget
-from docuPilot.ui.widgets.ScreenTileWidget import ScreenTileWidget
+from docupilot.ui.widgets.DeviceSelectorWidget import DeviceSelectorWidget
+from docupilot.ui.widgets.ScreenTileWidget import ScreenTileWidget
 
 
 class ScreenSelectorWidget(DeviceSelectorWidget):

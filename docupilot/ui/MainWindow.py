@@ -1,8 +1,8 @@
 from PySide6.QtWidgets import QMainWindow, QVBoxLayout, QWidget
 
-from docuPilot.ui.widgets.ScreenSelectorWidget import ScreenSelectorWidget
-from docuPilot.ui.widgets.MicrophoneSelectorWidget import MicrophoneSelectorWidget
-from docuPilot.ui.widgets.RecordButtonWidget import RecordButtonWidget
+from docupilot.ui.widgets.ScreenSelectorWidget import ScreenSelectorWidget
+from docupilot.ui.widgets.MicrophoneSelectorWidget import MicrophoneSelectorWidget
+from docupilot.ui.widgets.RecordButtonWidget import RecordButtonWidget
 
 class MainWindow(QMainWindow):
     def __init__(self) -> None:

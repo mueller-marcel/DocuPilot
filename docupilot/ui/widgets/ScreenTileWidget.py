@@ -1,7 +1,7 @@
 from PySide6.QtCore import QSize, Qt
 from PySide6.QtWidgets import QLabel, QWidget
 
-from docuPilot.ui.widgets.DeviceTileWidget import DeviceTileWidget
+from docupilot.ui.widgets.DeviceTileWidget import DeviceTileWidget
 
 
 class ScreenTileWidget(DeviceTileWidget):

@@ -1,7 +1,7 @@
 from PySide6.QtWidgets import QApplication
 import sys
 
-from docuPilot.ui.MainWindow import MainWindow
+from docupilot.ui.MainWindow import MainWindow
 
 
 def run():
