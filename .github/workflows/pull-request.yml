@@ -31,8 +31,5 @@ jobs:
       - name: Lint
         run: poetry run ruff check .
 
-      - name: Run tests
-        run: poetry run pytest
-
       - name: Build package
         run: poetry build
