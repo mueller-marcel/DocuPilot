@@ -2,8 +2,8 @@ from PySide6.QtCore import Signal
 from PySide6.QtMultimedia import QMediaDevices
 from PySide6.QtWidgets import QWidget
 
-from docuPilot.ui.widgets.DeviceSelectorWidget import DeviceSelectorWidget
-from docuPilot.ui.widgets.MicrophoneTileWidget import MicrophoneTileWidget
+from docupilot.ui.widgets.DeviceSelectorWidget import DeviceSelectorWidget
+from docupilot.ui.widgets.MicrophoneTileWidget import MicrophoneTileWidget
 
 
 class MicrophoneSelectorWidget(DeviceSelectorWidget):

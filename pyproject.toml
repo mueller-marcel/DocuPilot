@@ -2,26 +2,28 @@
 name = "DocuPilot"
 version = "0.0.1"
 description = "Records the screen, audio and input events to create user manuals"
-requires-python = ">=3.14"
+readme = "README.md"
+requires-python = ">=3.10,<3.15"
 dependencies = [
     "pyside6>=6.7",
 ]
 
-[project.optional-dependencies]
+[project.scripts]
+docupilot = "docupilot.app:run"
+
+[dependency-groups]
 dev = [
-  "pytest>=9,<10",
-  "ruff>=0.15,<0.16"
+    "pytest>=9,<10",
+    "ruff>=0.15,<0.16",
 ]
 
-[project.scripts]
-docupilot = "docupilot.main:run"
-
 [build-system]
-requires = ["setuptools"]
-build-backend = "setuptools.build_meta"
+requires = ["poetry-core>=1.0.0"]
+build-backend = "poetry.core.masonry.api"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 
 [tool.ruff]
 line-length = 100
+target-version = "py310"

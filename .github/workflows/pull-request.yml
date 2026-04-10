@@ -11,21 +11,25 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Checkout Repository
+      - name: Checkout repository
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
 
-      - name: Setup Python
+      - name: Set up Python
         uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6
         with:
-          python-version: "3.14"
-          cache: "pip"
+          python-version: "3.12"
 
-      - name: Upgrade pip
-        run: python -m pip install --upgrade pip
+      - name: Install Poetry
+        run: python -m pip install --upgrade pip && python -m pip install "poetry==2.3.0"
 
-      - name: Install project and dev dependencies
-        run: |
-          pip install -e ".[dev]"
+      - name: Validate Poetry configuration
+        run: poetry check --lock
+
+      - name: Install dependencies
+        run: poetry install --with dev
 
       - name: Lint
-        run: ruff check .
+        run: poetry run ruff check .
+
+      - name: Build package
+        run: poetry build
