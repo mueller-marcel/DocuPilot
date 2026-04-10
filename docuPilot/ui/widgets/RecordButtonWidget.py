@@ -1,50 +1,5 @@
-from __future__ import annotations
-
 from PySide6.QtCore import Qt, Signal, QSize
-from PySide6.QtGui import QColor, QIcon, QPainter, QPixmap
 from PySide6.QtWidgets import QPushButton, QSizePolicy, QWidget, QHBoxLayout
-
-
-def _create_record_icon(size: int = 12) -> QIcon:
-    """
-    Creates a red circular record icon.
-    :param size: Diameter of the icon in pixels.
-    :return: The generated icon.
-    """
-
-    pixmap = QPixmap(size, size)
-    pixmap.fill(Qt.GlobalColor.transparent)
-
-    painter = QPainter(pixmap)
-    painter.setRenderHint(QPainter.RenderHint.Antialiasing)
-    painter.setBrush(QColor("#ff3b30"))
-    painter.setPen(Qt.PenStyle.NoPen)
-    painter.drawEllipse(0, 0, size, size)
-    painter.end()
-
-    return QIcon(pixmap)
-
-
-def _create_stop_icon(size: int = 12) -> QIcon:
-    """
-    Creates a white square stop icon.
-    :param size: Size of the icon in pixels.
-    :return: The generated icon.
-    """
-
-    pixmap = QPixmap(size, size)
-    pixmap.fill(Qt.GlobalColor.transparent)
-
-    painter = QPainter(pixmap)
-    painter.setRenderHint(QPainter.RenderHint.Antialiasing)
-    painter.setBrush(QColor("#ffffff"))
-    painter.setPen(Qt.PenStyle.NoPen)
-
-    margin = 2
-    painter.drawRoundedRect(margin, margin, size - 2 * margin, size - 2 * margin, 2, 2)
-    painter.end()
-
-    return QIcon(pixmap)
 
 
 class RecordButtonWidget(QWidget):
@@ -64,7 +19,6 @@ class RecordButtonWidget(QWidget):
         self._button.setCursor(Qt.CursorShape.PointingHandCursor)
         self._button.setFixedSize(240, 42)
         self._button.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
-        self._button.setIcon(_create_record_icon())
         self._button.setIconSize(QSize(12, 12))
 
         self._button.toggled.connect(self._on_toggled)
@@ -84,7 +38,6 @@ class RecordButtonWidget(QWidget):
         """
 
         self._button.setText("Aufnahme starten")
-        self._button.setIcon(_create_record_icon())
 
         self._button.setStyleSheet(
             """
@@ -115,7 +68,6 @@ class RecordButtonWidget(QWidget):
         """
 
         self._button.setText("Aufnahme stoppen")
-        self._button.setIcon(_create_stop_icon())
 
         self._button.setStyleSheet(
             """
