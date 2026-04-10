@@ -1,5 +1,5 @@
 [project]
-name = "docupilot"
+name = "DocuPilot"
 version = "0.0.1"
 description = "Records the screen, audio and input events to create user manuals"
 readme = "README.md"
@@ -18,7 +18,7 @@ dev = [
 ]
 
 [build-system]
-requires = ["poetry-core>=1.9.0"]
+requires = ["poetry-core>=1.0.0"]
 build-backend = "poetry.core.masonry.api"
 
 [tool.pytest.ini_options]
