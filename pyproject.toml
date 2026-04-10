@@ -14,7 +14,7 @@ dev = [
 ]
 
 [project.scripts]
-docupilot = "docuPilot.app:run"
+docupilot = "docupilot.app:run"
 
 [build-system]
 requires = ["poetry-core>=1.0.0"]
