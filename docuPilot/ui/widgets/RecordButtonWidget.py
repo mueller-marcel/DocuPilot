@@ -1,4 +1,4 @@
-from PySide6.QtCore import Qt, Signal, QSize
+from PySide6.QtCore import Qt, Signal
 from PySide6.QtWidgets import QPushButton, QSizePolicy, QWidget, QHBoxLayout
 
 
@@ -17,9 +17,7 @@ class RecordButtonWidget(QWidget):
         self._button = QPushButton("Aufnahme starten")
         self._button.setCheckable(True)
         self._button.setCursor(Qt.CursorShape.PointingHandCursor)
-        self._button.setFixedSize(240, 42)
         self._button.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
-        self._button.setIconSize(QSize(12, 12))
 
         self._button.toggled.connect(self._on_toggled)
 
