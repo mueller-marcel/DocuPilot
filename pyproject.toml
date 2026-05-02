@@ -6,6 +6,7 @@ readme = "README.md"
 requires-python = ">=3.10,<3.15"
 dependencies = [
     "pyside6>=6.7",
+    "pynput (>=1.8.1,<2.0.0)",
 ]
 
 [project.scripts]
