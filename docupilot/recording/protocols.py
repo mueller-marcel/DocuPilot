@@ -8,10 +8,17 @@ class ScreenGeometry(Protocol):
     Represents the geometry of a screen (position and dimensions).
     """
 
-    def x(self) -> int: ...
-    def y(self) -> int: ...
-    def width(self) -> int: ...
-    def height(self) -> int: ...
+    def x(self) -> int:
+        ...
+
+    def y(self) -> int:
+        ...
+
+    def width(self) -> int:
+        ...
+
+    def height(self) -> int:
+        ...
 
 
 class Screen(Protocol):
@@ -19,9 +26,14 @@ class Screen(Protocol):
     Minimal interface for a screen device.
     """
 
-    def name(self) -> str: ...
-    def geometry(self) -> ScreenGeometry: ...
-    def device_pixel_ratio(self) -> float: ...
+    def name(self) -> str:
+        ...
+
+    def geometry(self) -> ScreenGeometry:
+        ...
+
+    def devicePixelRatio(self) -> float:
+        ...
 
 
 class Microphone(Protocol):
@@ -29,12 +41,13 @@ class Microphone(Protocol):
     Minimal interface for an audio input device.
     """
 
-    def description(self) -> str: ...
+    def description(self) -> str:
+        ...
 
 
 class ModalityRecorder(Protocol):
     """
-    Common interface for a single recording modality (screen, audio, input events).
+    Common interface for a single recording modality.
     """
 
     def start(self) -> None:

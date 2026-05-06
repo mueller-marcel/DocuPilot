@@ -17,7 +17,6 @@ class MainWindow(QMainWindow):
         """
         Initializes the main window.
         """
-
         super().__init__()
 
         self.setWindowTitle("DocuPilot")
@@ -37,7 +36,6 @@ class MainWindow(QMainWindow):
         """
         Set up the user interface.
         """
-
         central_widget = QWidget()
         self.setCentralWidget(central_widget)
 
@@ -45,9 +43,11 @@ class MainWindow(QMainWindow):
 
         self.screen_selector = ScreenSelectorWidget()
         self.screen_selector.screen_selected.connect(self.on_screen_selected)
+        self.on_screen_selected(self.screen_selector.get_selected_screen())
 
         self.microphone_selector = MicrophoneSelectorWidget()
         self.microphone_selector.microphone_selected.connect(self.on_microphone_selected)
+        self.on_microphone_selected(self.microphone_selector.get_selected_microphone())
 
         self.record_button_widget = RecordButtonWidget()
         self.record_button_widget.record_started.connect(self.on_record_started)
@@ -78,7 +78,6 @@ class MainWindow(QMainWindow):
         """
         Triggered when the user requests to start recording.
         """
-
         if self.record_button_widget is None:
             return
 
@@ -101,7 +100,7 @@ class MainWindow(QMainWindow):
             return
 
         try:
-            session = self.recorder_service.start_recording(
+            self.recorder_service.start_recording(
                 screen=self.selected_screen,
                 microphone=self.selected_microphone,
             )
@@ -117,9 +116,11 @@ class MainWindow(QMainWindow):
         """
         Triggered when the user requests to stop recording.
         """
+        if not self.recorder_service.is_recording():
+            return
 
         try:
-            session = self.recorder_service.stop_recording()
+            self.recorder_service.stop_recording()
         except Exception as exc:
             QMessageBox.critical(
                 self,

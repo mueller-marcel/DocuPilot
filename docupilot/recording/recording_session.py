@@ -19,17 +19,13 @@ class RecordingSession:
 
     screen: Screen
     microphone: Microphone
-
     session_id: uuid.UUID = field(default_factory=uuid.uuid4)
     started_at_utc: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
     start_monotonic_ns: int = field(default_factory=time.monotonic_ns)
-
     screen_file_name: str = "screen.mp4"
     audio_file_name: str = "voice.mp3"
     events_file_name: str = "events.json"
-
     base_dir: Path = field(default_factory=lambda: Path(tempfile.gettempdir()) / "docupilot")
-
     session_dir: Path = field(init=False)
 
     def __post_init__(self) -> None:
@@ -40,7 +36,6 @@ class RecordingSession:
         """
         Absolute path to the screen recording file.
         """
-
         return self.session_dir / self.screen_file_name
 
     @property
@@ -48,12 +43,13 @@ class RecordingSession:
         """
         Absolute path to the audio recording file.
         """
-
         return self.session_dir / self.audio_file_name
 
     @property
     def events_path(self) -> Path:
-        """Absolute path to the input-events JSON file."""
+        """
+        Absolute path to the input-events JSON file.
+        """
         return self.session_dir / self.events_file_name
 
     def session_time_ms(self) -> float:
@@ -80,6 +76,7 @@ class RecordingSessionSerializer:
         :return: A dictionary suitable for embedding in the events file.
         """
         geo = session.screen.geometry()
+
         return {
             "session_id": str(session.session_id),
             "session_dir": str(session.session_dir),
@@ -95,7 +92,7 @@ class RecordingSessionSerializer:
                 "y": geo.y(),
                 "width": geo.width(),
                 "height": geo.height(),
-                "device_pixel_ratio": session.screen.device_pixel_ratio(),
+                "device_pixel_ratio": session.screen.devicePixelRatio(),
             },
             "microphone": {
                 "description": session.microphone.description(),
