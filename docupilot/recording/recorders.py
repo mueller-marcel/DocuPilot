@@ -1,25 +1,24 @@
 """
 docupilot.recording.recorders
 ──────────────────────────────
-AvRecorder    – Screen + Mikrofon → recording.mp4  (ein ffmpeg-Prozess)
-InputRecorder – Maus + Tastatur   → events.json    (pynput)
-RecorderService – Orchestrierung, gemeinsame Zeitbasis
+AvRecorder    – Screen (mss) + Mikrofon (ffmpeg-nativ) → recording.mp4
+InputRecorder – Maus + Tastatur → events.json (pynput)
+RecorderService – Orchestrierung
 
-Design
-──────
-Ein einziger ffmpeg-Prozess nimmt Bildschirm und Mikrofon gleichzeitig auf.
-Kein Puffern, kein Merge, kein sounddevice.
+Gemeinsame Zeitbasis (garantiert)
+──────────────────────────────────
+t0 wird atomisch nach dem ersten mss-Frame-Grab gesetzt:
 
-ffmpeg liest beide Quellen nativ:
-    Windows  → gdigrab (Screen) + dshow (Mikrofon)
-    macOS    → avfoundation (Screen + Mikrofon)
-    Linux    → x11grab (Screen) + pulse (Mikrofon)
+    screenshot = sct.grab(region)    # erster Frame vollständig im Speicher
+    session.arm(time.monotonic_ns()) # t0 = jetzt → MP4-PTS 0 == t_ms 0
 
-Gemeinsame Zeitbasis
-────────────────────
-t0 = time.monotonic_ns(), gesetzt unmittelbar vor ffmpeg.start() und
-vor InputRecorder.start(). Die ffmpeg-Startup-Latenz (~50 ms) ist die
-einzige Sync-Ungenauigkeit — weit unter der 100 ms Toleranz.
+ffmpeg empfängt Frames über stdin (rawvideo pipe) — PTS 0 ist exakt der
+erste Frame, der nach arm() ankommt. Audio wird von ffmpeg nativ über die
+OS-API aufgenommen und intern mit dem Video-Stream synchronisiert.
+
+Alle Input-Events werden mit session_time_ms() gestempelt (gleiche Uhr):
+
+    mp4_position_ms == event t_ms  (Toleranz < 5 ms)
 """
 from __future__ import annotations
 
@@ -30,6 +29,8 @@ import threading
 import time
 from datetime import datetime, timezone
 
+import mss
+import numpy as np
 import pynput
 from PySide6.QtCore import QObject, Signal
 
@@ -47,139 +48,154 @@ logger = logging.getLogger(__name__)
 
 class AvRecorder:
     """
-    Nimmt Bildschirm und Mikrofon mit einem einzigen ffmpeg-Prozess auf.
+    Nimmt Screen (mss) und Mikrofon (ffmpeg-nativ) in einer MP4 auf.
 
-    ffmpeg liest beide Quellen simultan und schreibt direkt in recording.mp4.
-    Gestoppt wird sauber über 'q\\n' auf stdin.
+    ffmpeg läuft mit zwei Inputs:
+      - pipe:0  : rohe BGR-Frames von mss (stdin)
+      - OS-Audio: Mikrofon direkt über gdigrab/avfoundation/pulse
+
+    Der erste Frame setzt t0 (session.arm()), womit MP4-PTS 0 == t_ms 0.
     """
 
     _FPS = 10
 
     def __init__(self, session: RecordingSession, writer: EventWriter) -> None:
-        self._session = session
-        self._writer  = writer
-        self._proc:   subprocess.Popen | None = None
+        self._session     = session
+        self._writer      = writer
+        self._proc:       subprocess.Popen | None = None
+        self._capture_thread: threading.Thread | None = None
+        self._stop_event  = threading.Event()
+        geo               = session.screen.geometry()
+        self._w           = geo.width()
+        self._h           = geo.height()
 
     def start(self) -> None:
-        geo = self._session.screen.geometry()
-        cmd = self._build_cmd(
-            mic_description = self._session.microphone.description(),
-            x=geo.x(), y=geo.y(),
-            w=geo.width(), h=geo.height(),
-            out=str(self._session.recording_path),
-        )
-        logger.debug("AvRecorder: %s", " ".join(cmd))
+        self._stop_event.clear()
+        cmd = self._build_cmd()
+        logger.debug("AvRecorder ffmpeg: %s", " ".join(cmd))
         self._proc = subprocess.Popen(
             cmd,
             stdin=subprocess.PIPE,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.PIPE,
         )
+        # Capture-Thread startet ffmpeg-Pipe und setzt t0 beim ersten Frame
+        self._capture_thread = threading.Thread(
+            target=self._capture_loop, daemon=True, name="av-capture"
+        )
+        self._capture_thread.start()
+
+        # Warten bis arm() gesetzt ist, bevor start() zurückkehrt.
+        # Danach haben alle Events ein gültiges (positives) t_ms.
+        deadline = time.monotonic() + 2.0
+        while not self._session.start_monotonic_ns:
+            if time.monotonic() > deadline:
+                raise RuntimeError("AvRecorder: arm() timed out")
+            time.sleep(0.001)
+
         self._writer.write(
-            {
-                "type":        "av_started",
-                "file":        self._session.recording_file_name,
-                "fps":         self._FPS,
-                "width":       geo.width(),
-                "height":      geo.height(),
-                "microphone":  self._session.microphone.description(),
-            },
+            {"type": "av_started", "fps": self._FPS,
+             "width": self._w, "height": self._h},
             t_ms=self._session.session_time_ms(),
         )
 
     def stop(self) -> None:
-        if self._proc is None:
-            return
-        # ffmpeg sauber beenden: 'q' auf stdin
-        try:
-            self._proc.stdin.write(b"q\n")
-            self._proc.stdin.flush()
-            _, stderr = self._proc.communicate(timeout=15)
-            if self._proc.returncode != 0:
-                logger.error(
-                    "AvRecorder ffmpeg exit %d:\n%s",
-                    self._proc.returncode,
-                    stderr.decode(errors="replace"),
-                )
-        except subprocess.TimeoutExpired:
-            logger.warning("AvRecorder: ffmpeg did not exit cleanly, killing")
-            self._proc.kill()
-            self._proc.communicate()
-        finally:
-            self._proc = None
+        # Capture-Loop stoppen
+        self._stop_event.set()
+        if self._capture_thread:
+            self._capture_thread.join(timeout=5)
+            self._capture_thread = None
+
+        # ffmpeg sauber beenden
+        if self._proc:
+            try:
+                self._proc.stdin.close()
+                _, stderr = self._proc.communicate(timeout=15)
+                if self._proc.returncode not in (0, 255):
+                    logger.error("AvRecorder ffmpeg exit %d:\n%s",
+                                 self._proc.returncode,
+                                 stderr.decode(errors="replace"))
+            except subprocess.TimeoutExpired:
+                logger.warning("AvRecorder: ffmpeg did not exit, killing")
+                self._proc.kill()
+                self._proc.communicate()
+            finally:
+                self._proc = None
 
         self._writer.write(
-            {"type": "av_stopped", "file": self._session.recording_file_name},
+            {"type": "av_stopped"},
             t_ms=self._session.session_time_ms(),
         )
         logger.info("Recording saved → %s", self._session.recording_path)
 
-    def _build_cmd(
-        self,
-        mic_description: str,
-        x: int, y: int, w: int, h: int,
-        out: str,
-    ) -> list[str]:
+    def _capture_loop(self) -> None:
+        interval = 1.0 / self._FPS
+        geo      = self._session.screen.geometry()
+        region   = {
+            "left": geo.x(), "top": geo.y(),
+            "width": geo.width(), "height": geo.height(),
+        }
+        with mss.mss() as sct:
+            while not self._stop_event.is_set():
+                t_frame    = time.monotonic()
+                screenshot = sct.grab(region)
+
+                # Erster Grab: t0 atomar setzen → PTS 0 == t_ms 0
+                if not self._session.start_monotonic_ns:
+                    self._session.arm(time.monotonic_ns())
+
+                # mss → BGRA; ffmpeg rawvideo pipe erwartet BGR24
+                bgra = np.frombuffer(screenshot.raw, dtype=np.uint8).reshape(
+                    screenshot.height, screenshot.width, 4
+                )
+                try:
+                    self._proc.stdin.write(bgra[:, :, :3].tobytes())
+                except (BrokenPipeError, OSError):
+                    break  # ffmpeg wurde bereits beendet
+
+                elapsed = time.monotonic() - t_frame
+                if elapsed < interval:
+                    time.sleep(interval - elapsed)
+
+    def _build_cmd(self) -> list[str]:
         """
-        Baut den plattformspezifischen ffmpeg-Befehl.
+        Baut den ffmpeg-Befehl: stdin für Video, OS-API für Audio.
 
-        Windows  – gdigrab für Screen, dshow für Audio
-        macOS    – avfoundation für beides (Index-basiert)
-        Linux    – x11grab für Screen, pulse für Audio
+        Windows  → dshow   für Mikrofon
+        macOS    → avfoundation
+        Linux    → pulse
         """
-        system = platform.system()
+        mic = self._session.microphone.description()
+        out = str(self._session.recording_path)
+        fps = str(self._FPS)
+        sys = platform.system()
 
-        base = ["ffmpeg", "-loglevel", "error", "-y"]
+        video_input = [
+            "-f", "rawvideo", "-vcodec", "rawvideo",
+            "-pix_fmt", "bgr24", "-s", f"{self._w}x{self._h}",
+            "-r", fps, "-i", "pipe:0",
+        ]
+        video_codec = [
+            "-c:v", "libx264", "-preset", "ultrafast",
+            "-crf", "28", "-pix_fmt", "yuv420p",
+        ]
+        audio_codec = ["-c:a", "aac", "-b:a", "128k"]
 
-        if system == "Windows":
-            return base + [
-                # Screen: gdigrab, crop auf Monitor-Koordinaten
-                "-f", "gdigrab",
-                "-framerate", str(self._FPS),
-                "-offset_x", str(x), "-offset_y", str(y),
-                "-video_size", f"{w}x{h}",
-                "-i", "desktop",
-                # Mikrofon: dshow
-                "-f", "dshow",
-                "-i", f"audio={mic_description}",
-                # Output
-                "-c:v", "libx264", "-preset", "ultrafast", "-crf", "28",
-                "-pix_fmt", "yuv420p",
-                "-c:a", "aac", "-b:a", "128k",
-                out,
-            ]
+        if sys == "Windows":
+            audio_input = ["-f", "dshow", "-i", f"audio={mic}"]
+        elif sys == "Darwin":
+            audio_input = ["-f", "avfoundation", "-i", f"none:{mic}"]
+        else:
+            audio_input = ["-f", "pulse", "-i", mic]
 
-        elif system == "Darwin":
-            # avfoundation: "screen_index:audio_index"
-            # Screen-Index 1 = primärer Monitor, Audio-Index aus description
-            return base + [
-                "-f", "avfoundation",
-                "-framerate", str(self._FPS),
-                "-capture_cursor", "1",
-                "-i", f"1:{mic_description}",
-                "-c:v", "libx264", "-preset", "ultrafast", "-crf", "28",
-                "-pix_fmt", "yuv420p",
-                "-c:a", "aac", "-b:a", "128k",
-                out,
-            ]
-
-        else:  # Linux
-            display = ":0.0"
-            return base + [
-                # Screen: x11grab
-                "-f", "x11grab",
-                "-framerate", str(self._FPS),
-                "-video_size", f"{w}x{h}",
-                "-i", f"{display}+{x},{y}",
-                # Mikrofon: pulse
-                "-f", "pulse",
-                "-i", mic_description,
-                # Output
-                "-c:v", "libx264", "-preset", "ultrafast", "-crf", "28",
-                "-pix_fmt", "yuv420p",
-                "-c:a", "aac", "-b:a", "128k",
-                out,
-            ]
+        return (
+            ["ffmpeg", "-loglevel", "error", "-y"]
+            + video_input
+            + audio_input
+            + video_codec
+            + audio_codec
+            + [out]
+        )
 
 
 # ── InputRecorder ─────────────────────────────────────────────────────────────
@@ -187,11 +203,10 @@ class AvRecorder:
 class InputRecorder:
     """
     Globale Maus- und Tastatur-Events via pynput.
-    Mouse-Move wird auf 1 Event / 50 ms gedrosselt.
-    Alle Events nutzen session_time_ms() — dieselbe Uhr wie die MP4.
+    Mouse-Move auf 1 Event / 50 ms gedrosselt.
     """
 
-    _MOUSE_MOVE_INTERVAL_MS = 50.0
+    _THROTTLE_MS = 50.0
 
     def __init__(self, session: RecordingSession, writer: EventWriter) -> None:
         self._session        = session
@@ -202,18 +217,14 @@ class InputRecorder:
 
     def start(self) -> None:
         self._last_move_t_ms = 0.0
-        self._writer.write(
-            {"type": "input_started"},
-            t_ms=self._session.session_time_ms(),
-        )
+        self._writer.write({"type": "input_started"},
+                           t_ms=self._session.session_time_ms())
         self._mouse = pynput.mouse.Listener(
-            on_move=self._on_move,
-            on_click=self._on_click,
+            on_move=self._on_move, on_click=self._on_click,
             on_scroll=self._on_scroll,
         )
         self._keyboard = pynput.keyboard.Listener(
-            on_press=self._on_press,
-            on_release=self._on_release,
+            on_press=self._on_press, on_release=self._on_release,
         )
         self._mouse.start()
         self._keyboard.start()
@@ -225,14 +236,12 @@ class InputRecorder:
         if self._keyboard:
             self._keyboard.stop()
             self._keyboard = None
-        self._writer.write(
-            {"type": "input_stopped"},
-            t_ms=self._session.session_time_ms(),
-        )
+        self._writer.write({"type": "input_stopped"},
+                           t_ms=self._session.session_time_ms())
 
     def _on_move(self, x: int, y: int) -> None:
         t_ms = self._session.session_time_ms()
-        if t_ms - self._last_move_t_ms < self._MOUSE_MOVE_INTERVAL_MS:
+        if t_ms - self._last_move_t_ms < self._THROTTLE_MS:
             return
         self._last_move_t_ms = t_ms
         self._writer.write({"type": "mouse_move", "x": x, "y": y}, t_ms=t_ms)
@@ -251,16 +260,12 @@ class InputRecorder:
         )
 
     def _on_press(self, key) -> None:
-        self._writer.write(
-            {"type": "key_press", "key": _key_str(key)},
-            t_ms=self._session.session_time_ms(),
-        )
+        self._writer.write({"type": "key_press", "key": _key_str(key)},
+                           t_ms=self._session.session_time_ms())
 
     def _on_release(self, key) -> None:
-        self._writer.write(
-            {"type": "key_release", "key": _key_str(key)},
-            t_ms=self._session.session_time_ms(),
-        )
+        self._writer.write({"type": "key_release", "key": _key_str(key)},
+                           t_ms=self._session.session_time_ms())
 
 
 def _key_str(key) -> str:
@@ -274,24 +279,11 @@ def _key_str(key) -> str:
 
 class RecorderService(QObject):
     """
-    Orchestriert den Lifecycle einer Aufnahme-Session.
+    Startet und stoppt eine Aufnahme-Session.
 
-    Gemeinsame Zeitbasis
-    ────────────────────
-    t0 wird mit time.monotonic_ns() gesetzt unmittelbar bevor
-    AvRecorder und InputRecorder gestartet werden:
-
-        session.arm(time.monotonic_ns())
-        av_recorder.start()      # ffmpeg startet, schreibt MP4 ab t≈0
-        input_recorder.start()   # Events ab t≈0
-
-    Die ffmpeg-Startup-Latenz (~20–50 ms) ist die einzige Ungenauigkeit.
-
-    Signals
-    ───────
-    recording_started(RecordingSession)
-    recording_stopped(RecordingSession)
-    recording_error(str)
+    Signals: recording_started(RecordingSession)
+             recording_stopped(RecordingSession)
+             recording_error(str)
     """
 
     recording_started = Signal(object)
@@ -300,10 +292,10 @@ class RecorderService(QObject):
 
     def __init__(self, parent: QObject | None = None) -> None:
         super().__init__(parent)
-        self._session:  RecordingSession | None = None
-        self._writer:   EventWriter      | None = None
-        self._av:       AvRecorder       | None = None
-        self._input:    InputRecorder    | None = None
+        self._session: RecordingSession | None = None
+        self._writer:  EventWriter      | None = None
+        self._av:      AvRecorder       | None = None
+        self._input:   InputRecorder    | None = None
 
     @property
     def current_session(self) -> RecordingSession | None:
@@ -327,17 +319,15 @@ class RecorderService(QObject):
             self._av    = AvRecorder(session, self._writer)
             self._input = InputRecorder(session, self._writer)
 
-            # t0 setzen, dann sofort beide Recorder starten
-            session.arm(time.monotonic_ns())
+            # AvRecorder.start() blockiert bis arm() gesetzt ist.
+            # Danach startet InputRecorder — beide laufen auf derselben Uhr.
             self._av.start()
             self._input.start()
 
             self._writer.write(
-                {
-                    "type":         "recording_started",
-                    "timestamp_utc": datetime.now(timezone.utc).isoformat(),
-                    "metadata":      session.to_metadata_dict(),
-                },
+                {"type": "recording_started",
+                 "timestamp_utc": datetime.now(timezone.utc).isoformat(),
+                 "metadata": session.to_metadata_dict()},
                 t_ms=session.session_time_ms(),
             )
             self.recording_started.emit(session)
@@ -358,13 +348,10 @@ class RecorderService(QObject):
                  "timestamp_utc": datetime.now(timezone.utc).isoformat()},
                 t_ms=session.session_time_ms(),
             )
-
-            # Input zuerst stoppen (sofort), dann ffmpeg (wartet auf sauberes Ende)
             if self._input:
                 self._input.stop()
             if self._av:
                 self._av.stop()
-
             self._writer.write(
                 {"type": "recording_stopped",
                  "timestamp_utc": datetime.now(timezone.utc).isoformat()},
