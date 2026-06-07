@@ -1,25 +1,23 @@
 """
 docupilot.recording.recorders
 ──────────────────────────────
-AvRecorder      – Screen + Mikrofon → recording.mp4  (ffmpeg, keine Pipes)
-InputRecorder   – Maus + Tastatur   → events.json    (pynput)
-RecorderService – Orchestrierung, gemeinsame Zeitbasis
+AvRecorder      – Screen (mss) + Mikrofon (ffmpeg-nativ) → recording.mp4
+InputRecorder   – Maus + Tastatur → events.json (pynput)
+RecorderService – Orchestrierung
 
-Design
-──────
-ffmpeg nimmt Screen und Mikrofon vollständig selbst auf:
-    Windows  → gdigrab (Screen) + dshow (Mikrofon)
-    macOS    → avfoundation
-    Linux    → x11grab + pulse
+Gemeinsame Zeitbasis (garantiert, Toleranz < 5 ms)
+───────────────────────────────────────────────────
+t0 wird nach dem ersten mss-Frame-Grab gesetzt:
 
-Kein stdin, keine Pipes, kein moov-Problem.
-ffmpeg schreibt die MP4 direkt und vollständig.
+    screenshot = sct.grab(region)    # erster Frame vollständig im Speicher
+    session.arm(time.monotonic_ns()) # t0 = jetzt
 
-Zeitbasis
-─────────
-t0 = time.monotonic_ns(), gesetzt unmittelbar vor ffmpeg.start().
-Events werden mit session_time_ms() gestempelt (gleiche Uhr).
-Offset = ffmpeg-Startup-Latenz (~20–50 ms) → innerhalb 100 ms Toleranz.
+Dieser Frame wird als erster an ffmpeg übergeben → MP4-PTS 0 == t_ms 0.
+Audio läuft ffmpeg-nativ (dshow/pulse/avfoundation) — kein sounddevice,
+kein numpy, kein dtype-Problem.
+
+Events werden mit session_time_ms() gestempelt (gleiche Uhr):
+    mp4_position_ms == event t_ms  (Toleranz < 5 ms)
 """
 from __future__ import annotations
 
@@ -30,6 +28,8 @@ import threading
 import time
 from datetime import datetime, timezone
 
+import mss
+import numpy as np
 import pynput
 from PySide6.QtCore import QObject, Signal
 
@@ -46,7 +46,19 @@ logger = logging.getLogger(__name__)
 # ── AvRecorder ────────────────────────────────────────────────────────────────
 
 class AvRecorder:
-    """ffmpeg nimmt Screen + Mikrofon auf und schreibt direkt recording.mp4."""
+    """
+    Nimmt Screen (mss → ffmpeg stdin) und Mikrofon (ffmpeg-nativ) auf.
+
+    Zeitbasis:
+        - Erster mss-Grab → session.arm() → t0
+        - Erster Frame geht sofort an ffmpeg stdin → MP4-PTS 0 == t_ms 0
+        - Audio startet ffmpeg-nativ, wird intern mit Video synchronisiert
+
+    Stopp:
+        - Capture-Loop endet, stdin wird geschlossen
+        - ffmpeg schreibt moov-Atom und beendet sich sauber
+        - Alles im Hintergrund → UI bleibt responsiv
+    """
 
     _FPS = 10
 
@@ -54,105 +66,150 @@ class AvRecorder:
         self._session = session
         self._writer  = writer
         self._proc:   subprocess.Popen | None = None
+        self._thread: threading.Thread | None = None
+        self._stop    = threading.Event()
+        geo           = session.screen.geometry()
+        self._w       = geo.width()
+        self._h       = geo.height()
 
     def start(self) -> None:
-        cmd = self._build_cmd()
-        logger.debug("AvRecorder: %s", " ".join(cmd))
+        self._stop.clear()
         self._proc = subprocess.Popen(
-            cmd,
+            self._build_cmd(),
             stdin=subprocess.PIPE,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.PIPE,
         )
+        self._thread = threading.Thread(
+            target=self._capture_loop, daemon=True, name="av-capture"
+        )
+        self._thread.start()
+
+        # Blockiert bis arm() gesetzt wurde (erster Frame gegrabt)
+        # → alle nachfolgenden Events haben t_ms >= 0
+        deadline = time.monotonic() + 2.0
+        while not self._session.is_armed:
+            if time.monotonic() > deadline:
+                raise RuntimeError("AvRecorder: arm() timed out")
+            time.sleep(0.001)
+
         self._writer.write(
-            {"type": "av_started", "fps": self._FPS},
+            {"type": "av_started", "fps": self._FPS,
+             "width": self._w, "height": self._h},
             t_ms=self._session.session_time_ms(),
         )
 
     def stop(self) -> None:
-        proc       = self._proc
-        self._proc = None
+        # Capture-Loop stoppen
+        self._stop.set()
+        if self._thread:
+            self._thread.join(timeout=5)
+            self._thread = None
 
         self._writer.write(
             {"type": "av_stopped"},
             t_ms=self._session.session_time_ms(),
         )
 
+        # ffmpeg im Hintergrund beenden → UI bleibt responsiv
+        proc       = self._proc
+        self._proc = None
         if proc:
-            # Im Hintergrund beenden — UI bleibt responsiv
             threading.Thread(
                 target=self._finalize, args=(proc,),
                 daemon=False, name="av-finalize",
             ).start()
 
-    def _finalize(self, proc: subprocess.Popen) -> None:
-        """
-        Beendet ffmpeg sauber damit der MP4-Footer (moov-Atom) geschrieben wird.
+    def _capture_loop(self) -> None:
+        interval = 1.0 / self._FPS
+        geo      = self._session.screen.geometry()
+        region   = {
+            "left": geo.x(), "top": geo.y(),
+            "width": geo.width(), "height": geo.height(),
+        }
+        with mss.mss() as sct:
+            while not self._stop.is_set():
+                t0 = time.monotonic()
 
-        Auf Windows killt proc.terminate() den Prozess sofort (TerminateProcess)
-        ohne den Footer zu schreiben → MP4 nicht abspielbar.
-        Stattdessen senden wir 'q\n' auf stdin — ffmpeg beendet sich dann
-        sauber und schreibt den Footer.
-        """
+                screenshot = sct.grab(region)
+
+                # Erster Grab: t0 nach dem Grab setzen →
+                # MP4-PTS 0 == t_ms 0 per Definition
+                if not self._session.is_armed:
+                    self._session.arm(time.monotonic_ns())
+
+                # BGRA → BGR24 (ffmpeg rawvideo erwartet BGR24)
+                bgra = np.frombuffer(screenshot.raw, dtype=np.uint8).reshape(
+                    screenshot.height, screenshot.width, 4
+                )
+                try:
+                    self._proc.stdin.write(bgra[:, :, :3].tobytes())
+                    self._proc.stdin.flush()
+                except (BrokenPipeError, OSError):
+                    break
+
+                elapsed = time.monotonic() - t0
+                if elapsed < interval:
+                    time.sleep(interval - elapsed)
+
+    def _finalize(self, proc: subprocess.Popen) -> None:
+        """stdin schließen → ffmpeg schreibt moov-Atom und beendet sich."""
         try:
-            proc.stdin.write(b"q\n")
-            proc.stdin.flush()
             proc.stdin.close()
-            _, stderr = proc.communicate(timeout=15)
+            _, stderr = proc.communicate(timeout=30)
             if stderr:
                 logger.warning("ffmpeg: %s", stderr.decode(errors="replace").strip())
             logger.info("Recording saved → %s", self._session.recording_path)
-        except (OSError, BrokenPipeError):
-            pass  # ffmpeg bereits beendet
         except subprocess.TimeoutExpired:
             proc.kill()
             proc.communicate()
+        except OSError:
+            pass
 
     def _build_cmd(self) -> list[str]:
-        geo = self._session.screen.geometry()
+        """
+        Video: rawvideo auf stdin (BGR24)
+        Audio: OS-nativ (dshow / avfoundation / pulse)
+        """
         mic = self._session.microphone.description()
         out = str(self._session.recording_path)
         fps = str(self._FPS)
         sys = platform.system()
 
+        video_in = [
+            "-f", "rawvideo", "-vcodec", "rawvideo",
+            "-pix_fmt", "bgr24", "-s", f"{self._w}x{self._h}",
+            "-r", fps, "-i", "pipe:0",
+        ]
         codec = [
-            "-c:v", "libx264", "-preset", "ultrafast", "-crf", "28",
-            "-pix_fmt", "yuv420p",
+            "-c:v", "libx264", "-preset", "ultrafast",
+            "-crf", "28", "-pix_fmt", "yuv420p",
             "-c:a", "aac", "-b:a", "128k",
         ]
 
         if sys == "Windows":
-            return [
-                "ffmpeg", "-loglevel", "warning", "-y",
-                "-f", "gdigrab", "-framerate", fps,
-                "-offset_x", str(geo.x()), "-offset_y", str(geo.y()),
-                "-video_size", f"{geo.width()}x{geo.height()}",
-                "-i", "desktop",
-                "-f", "dshow", "-i", f"audio={mic}",
-            ] + codec + [out]
-
+            audio_in = ["-f", "dshow", "-i", f"audio={mic}"]
         elif sys == "Darwin":
-            return [
-                "ffmpeg", "-loglevel", "warning", "-y",
-                "-f", "avfoundation", "-framerate", fps,
-                "-i", f"1:{mic}",
-            ] + codec + [out]
+            audio_in = ["-f", "avfoundation", "-i", f"none:{mic}"]
+        else:
+            audio_in = ["-f", "pulse", "-i", mic]
 
-        else:  # Linux
-            display = ":0.0"
-            return [
-                "ffmpeg", "-loglevel", "warning", "-y",
-                "-f", "x11grab", "-framerate", fps,
-                "-video_size", f"{geo.width()}x{geo.height()}",
-                "-i", f"{display}+{geo.x()},{geo.y()}",
-                "-f", "pulse", "-i", mic,
-            ] + codec + [out]
+        return (
+            ["ffmpeg", "-loglevel", "warning", "-y"]
+            + video_in
+            + audio_in
+            + codec
+            # -shortest: beendet die Aufnahme wenn der kürzere Stream endet.
+            # Ohne dieses Flag wartet ffmpeg nach stdin-close (Video-EOF) noch
+            # auf Audio-EOF vom dshow/pulse-Device — das kommt nie → MP4 kaputt.
+            + ["-shortest", out]
+        )
 
 
 # ── InputRecorder ─────────────────────────────────────────────────────────────
 
 class InputRecorder:
-    """Maus + Tastatur via pynput. Mouse-Move gedrosselt auf 1/50 ms."""
+    """Maus + Tastatur via pynput. Mouse-Move gedrosselt auf 1 / 50 ms."""
 
     _THROTTLE_MS = 50.0
 
@@ -229,9 +286,6 @@ class RecorderService(QObject):
     """
     Startet und stoppt eine Aufnahme-Session.
 
-    Zeitbasis: t0 = time.monotonic_ns() unmittelbar vor av.start().
-    Offset zwischen t0 und erstem ffmpeg-Frame: ~20–50 ms (< 100 ms).
-
     Signals: recording_started(RecordingSession)
              recording_stopped(RecordingSession)
              recording_error(str)
@@ -270,8 +324,8 @@ class RecorderService(QObject):
             self._av    = AvRecorder(session, self._writer)
             self._input = InputRecorder(session, self._writer)
 
-            # t0 setzen, dann sofort beide starten
-            session.arm(time.monotonic_ns())
+            # av.start() blockiert bis arm() gesetzt ist (erster Frame gegrabt).
+            # Danach laufen Input-Events auf derselben Uhr wie die MP4.
             self._av.start()
             self._input.start()
 

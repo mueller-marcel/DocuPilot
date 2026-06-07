@@ -54,6 +54,7 @@ class RecordingSession:
     session_id:         uuid.UUID = field(default_factory=uuid.uuid4)
     started_at_utc:     datetime  = field(default_factory=lambda: datetime.now(timezone.utc))
     start_monotonic_ns: int       = field(default=0, init=False)
+    _armed:             bool      = field(default=False, init=False, repr=False)
 
     recording_file_name: str  = "recording.mp4"
     events_file_name:    str  = "events.json"
@@ -68,6 +69,11 @@ class RecordingSession:
     def arm(self, t0_ns: int) -> None:
         """Setzt den gemeinsamen Uhren-Ursprung."""
         self.start_monotonic_ns = t0_ns
+        self._armed = True
+
+    @property
+    def is_armed(self) -> bool:
+        return self._armed
 
     def session_time_ms(self) -> float:
         """Millisekunden seit t0. Negativ wenn vor arm()."""
