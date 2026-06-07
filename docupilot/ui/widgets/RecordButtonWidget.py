@@ -1,24 +1,30 @@
-from PySide6.QtCore import Qt, Signal
-from PySide6.QtWidgets import QPushButton, QSizePolicy, QWidget, QHBoxLayout
+from __future__ import annotations
+
+from PySide6.QtCore import QSignalBlocker, Qt, Signal
+from PySide6.QtWidgets import QHBoxLayout, QPushButton, QSizePolicy, QWidget
 
 
 class RecordButtonWidget(QWidget):
+    """
+    Start/stop recording button.
+
+    User clicks emit record_started or record_stopped.
+    Programmatic state changes can update the UI without emitting signals.
+    """
+
     record_started = Signal()
     record_stopped = Signal()
 
     def __init__(self, parent: QWidget | None = None) -> None:
-        """
-        Initialize the record button widget.
-        :param parent: The parent widget.
-        """
-
         super().__init__(parent)
 
         self._button = QPushButton("Aufnahme starten")
         self._button.setCheckable(True)
         self._button.setCursor(Qt.CursorShape.PointingHandCursor)
-        self._button.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
-
+        self._button.setSizePolicy(
+            QSizePolicy.Policy.Fixed,
+            QSizePolicy.Policy.Fixed,
+        )
         self._button.toggled.connect(self._on_toggled)
 
         self._apply_start_style()
@@ -29,14 +35,57 @@ class RecordButtonWidget(QWidget):
         layout.addWidget(self._button)
         layout.addStretch()
 
+    def is_recording(self) -> bool:
+        return self._button.isChecked()
+
+    def start_recording(self) -> None:
+        """
+        Set the button to recording state without emitting record_started.
+        """
+        self.set_recording_state(True, emit_signal=False)
+
+    def stop_recording(self) -> None:
+        """
+        Set the button to stopped state without emitting record_stopped.
+        """
+        self.set_recording_state(False, emit_signal=False)
+
+    def set_recording_state(self, recording: bool, emit_signal: bool = False) -> None:
+        """
+        Set the visual recording state.
+
+        :param recording: True for active recording UI state.
+        :param emit_signal: Whether the state change should emit Qt signals.
+        """
+        if self._button.isChecked() == recording:
+            return
+
+        if emit_signal:
+            self._button.setChecked(recording)
+            return
+
+        blocker = QSignalBlocker(self._button)
+        self._button.setChecked(recording)
+        del blocker
+
+        if recording:
+            self._apply_stop_style()
+        else:
+            self._apply_start_style()
+
+    def _on_toggled(self, checked: bool) -> None:
+        """
+        Handle real user-triggered toggle changes.
+        """
+        if checked:
+            self._apply_stop_style()
+            self.record_started.emit()
+        else:
+            self._apply_start_style()
+            self.record_stopped.emit()
+
     def _apply_start_style(self) -> None:
-        """
-        Applies the visual style for the 'start recording' state.
-        :return: None
-        """
-
         self._button.setText("Aufnahme starten")
-
         self._button.setStyleSheet(
             """
             QPushButton {
@@ -60,13 +109,7 @@ class RecordButtonWidget(QWidget):
         )
 
     def _apply_stop_style(self) -> None:
-        """
-        Applies the visual style for the 'stop recording' state.
-        :return: None
-        """
-
         self._button.setText("Aufnahme stoppen")
-
         self._button.setStyleSheet(
             """
             QPushButton {
@@ -88,43 +131,3 @@ class RecordButtonWidget(QWidget):
             }
             """
         )
-
-    def _on_toggled(self, checked: bool) -> None:
-        """
-        Handles the toggle state of the button.
-        :param checked: True if the recording is active, otherwise False.
-        :return: None
-        """
-
-        if checked:
-            self._apply_stop_style()
-            self.record_started.emit()
-        else:
-            self._apply_start_style()
-            self.record_stopped.emit()
-
-    def is_recording(self) -> bool:
-        """
-        Returns whether the recording is currently active.
-        :return: True if the recording is active, otherwise False.
-        """
-
-        return self._button.isChecked()
-
-    def start_recording(self) -> None:
-        """
-        Activates the recording state programmatically.
-        :return: None
-        """
-
-        if not self._button.isChecked():
-            self._button.setChecked(True)
-
-    def stop_recording(self) -> None:
-        """
-        Deactivates the recording state programmatically.
-        :return: None
-        """
-
-        if self._button.isChecked():
-            self._button.setChecked(False)
