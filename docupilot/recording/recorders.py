@@ -43,6 +43,7 @@ class AvRecorder:
         self._proc: subprocess.Popen | None = None
         self._thread: threading.Thread | None = None
         self._stop = threading.Event()
+        self._on_done_callback = None  # set by RecorderService
         geo = session.screen.geometry()
         self._w = geo.width()
         self._h = geo.height()
@@ -95,7 +96,7 @@ class AvRecorder:
         if proc:
             threading.Thread(
                 target=self._finalize,
-                args=(proc,),
+                args=(proc, self._on_done_callback),
                 daemon=False,
                 name="av-finalize",
             ).start()
@@ -136,7 +137,7 @@ class AvRecorder:
                     time.sleep(interval - elapsed)
 
     @staticmethod
-    def _finalize(proc: subprocess.Popen) -> None:
+    def _finalize(proc: subprocess.Popen, on_done=None) -> None:
         """
         Finalizes the audiovisual recording process by closing the stdin pipe and waiting for
         :param proc: The subprocess object representing the recording process.
@@ -151,6 +152,8 @@ class AvRecorder:
             proc.communicate()
         except OSError:
             pass
+        if on_done is not None:
+            on_done()
 
     def _build_cmd(self) -> list[str]:
         """
@@ -304,6 +307,7 @@ class RecorderService(QObject):
     recording_started = Signal(object)
     recording_stopped = Signal(object)
     recording_error = Signal(str)
+    recording_finalized = Signal(object)  # emitted when ffmpeg has finished writing
 
     def __init__(self, parent: QObject | None = None) -> None:
         super().__init__(parent)
@@ -333,6 +337,7 @@ class RecorderService(QObject):
             if self._writer:
                 self._writer.open()
                 self._av = AvRecorder(session, self._writer)
+                self._av._on_done_callback = lambda: self.recording_finalized.emit(session)
                 self._input = InputRecorder(session, self._writer)
 
             if self._av and self._input:

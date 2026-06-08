@@ -2,45 +2,68 @@ from __future__ import annotations
 
 from typing import Any
 
-from PySide6.QtWidgets import QMainWindow, QMessageBox, QVBoxLayout, QWidget
+from PySide6.QtCore import Qt
+from PySide6.QtWidgets import (
+    QLabel,
+    QMainWindow,
+    QMessageBox,
+    QStackedWidget,
+    QVBoxLayout,
+    QWidget,
+)
 
 from docupilot.recording.recorders import RecorderService
+from docupilot.recording.session import RecordingSession
+from docupilot.ui.AnnotationWindow import AnnotationWindow
 from docupilot.ui.widgets.MicrophoneSelectorWidget import MicrophoneSelectorWidget
 from docupilot.ui.widgets.RecordButtonWidget import RecordButtonWidget
 from docupilot.ui.widgets.ScreenSelectorWidget import ScreenSelectorWidget
+
+_PAGE_RECORDER = 0
+_PAGE_ANNOTATION = 1
+_PAGE_WAITING = 2
 
 
 class MainWindow(QMainWindow):
     """
     Main application window.
 
-    This class wires widgets to the RecorderService.
-    Recording lifecycle logic remains inside RecorderService.
+    Wires the selector widgets to the RecorderService and uses a QStackedWidget
+    to switch between the recorder page and the annotation page. After a
+    recording is stopped, the app navigates to the annotation page for the
+    just-finished session.
     """
 
     def __init__(self) -> None:
         super().__init__()
 
         self.setWindowTitle("DocuPilot")
-        self.resize(1000, 750)
+        self.resize(1200, 800)
 
         self.selected_screen: Any | None = None
         self.selected_microphone: Any | None = None
 
         self.recorder_service = RecorderService(parent=self)
         self.recorder_service.recording_error.connect(self.on_recording_error)
+        self.recorder_service.recording_finalized.connect(self._on_recording_finalized)
 
         self.screen_selector: ScreenSelectorWidget | None = None
         self.microphone_selector: MicrophoneSelectorWidget | None = None
         self.record_button_widget: RecordButtonWidget | None = None
+        self.annotation_window: AnnotationWindow | None = None
 
-        self._setup_ui()
+        self._stack = QStackedWidget()
+        self.setCentralWidget(self._stack)
 
-    def _setup_ui(self) -> None:
-        central_widget = QWidget()
-        self.setCentralWidget(central_widget)
+        self._setup_recorder_page()
+        self._setup_annotation_page()
+        self._setup_waiting_page()
 
-        box_layout = QVBoxLayout(central_widget)
+    # ── Page setup ───────────────────────────────────────────────────────────
+
+    def _setup_recorder_page(self) -> None:
+        page = QWidget()
+        box_layout = QVBoxLayout(page)
 
         self.screen_selector = ScreenSelectorWidget()
         self.screen_selector.screen_selected.connect(self.on_screen_selected)
@@ -63,11 +86,49 @@ class MainWindow(QMainWindow):
         box_layout.addStretch()
         box_layout.addWidget(self.record_button_widget)
 
+        self._stack.insertWidget(_PAGE_RECORDER, page)
+
+    def _setup_annotation_page(self) -> None:
+        self.annotation_window = AnnotationWindow()
+        self.annotation_window.back_requested.connect(self._show_recorder_page)
+        self._stack.insertWidget(_PAGE_ANNOTATION, self.annotation_window)
+
+
+    def _setup_waiting_page(self) -> None:
+        page = QWidget()
+        page.setStyleSheet("background:#111;")
+        layout = QVBoxLayout(page)
+        label = QLabel("Aufnahme wird finalisiert\nBitte warten…")
+        label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        label.setStyleSheet("color:#aaa; font-size:16px; line-height:1.8;")
+        layout.addStretch()
+        layout.addWidget(label)
+        layout.addStretch()
+        self._stack.insertWidget(_PAGE_WAITING, page)
+
+    # ── Navigation ───────────────────────────────────────────────────────────
+
+    def _show_recorder_page(self) -> None:
+        if self.record_button_widget is not None:
+            self.record_button_widget.stop_recording()
+        self._stack.setCurrentIndex(_PAGE_RECORDER)
+
+    def _show_annotation_page(self, session: RecordingSession) -> None:
+        if self.annotation_window is not None:
+            self.annotation_window.load_session(session)
+        self._stack.setCurrentIndex(_PAGE_ANNOTATION)
+
+    # ── Device selection ─────────────────────────────────────────────────────
+
     def on_screen_selected(self, screen: Any) -> None:
+        # screen is already a protocol-compliant adapter (built in ScreenTileWidget).
         self.selected_screen = screen
 
     def on_microphone_selected(self, microphone: Any) -> None:
+        # QAudioDevice already satisfies the Microphone protocol (description()).
         self.selected_microphone = microphone
+
+    # ── Recording lifecycle ──────────────────────────────────────────────────
 
     def on_record_started(self) -> None:
         if self.record_button_widget is None:
@@ -95,11 +156,17 @@ class MainWindow(QMainWindow):
 
         try:
             self.recorder_service.stop_recording()
+            # Navigate to waiting page; _on_recording_finalized will switch to annotation
+            self._stack.setCurrentIndex(_PAGE_WAITING)
         except Exception as exc:
             self._show_error(
                 title="Recording Could Not Be Stopped",
                 message=str(exc),
             )
+
+    def _on_recording_finalized(self, session) -> None:
+        """Called by RecorderService once ffmpeg has finished writing the file."""
+        self._show_annotation_page(session)
 
     def on_recording_error(self, message: str) -> None:
         if self.record_button_widget is not None:
@@ -109,6 +176,8 @@ class MainWindow(QMainWindow):
             title="Recording Error",
             message=message,
         )
+
+    # ── Validation & dialogs ─────────────────────────────────────────────────
 
     def _has_valid_selection(self) -> bool:
         if self.selected_screen is None:
@@ -128,15 +197,7 @@ class MainWindow(QMainWindow):
         return True
 
     def _show_warning(self, title: str, message: str) -> None:
-        QMessageBox.warning(
-            self,
-            title,
-            message,
-        )
+        QMessageBox.warning(self, title, message)
 
     def _show_error(self, title: str, message: str) -> None:
-        QMessageBox.critical(
-            self,
-            title,
-            message,
-        )
+        QMessageBox.critical(self, title, message)
