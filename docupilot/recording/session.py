@@ -1,10 +1,3 @@
-"""
-docupilot.recording.session
-───────────────────────────
-RecordingSession  – Pfade und gemeinsame Uhr
-EventWriter       – Thread-sicheres JSON-Array
-Protocols         – Screen, Microphone, ModalityRecorder
-"""
 from __future__ import annotations
 
 import json
@@ -16,9 +9,6 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Protocol
-
-
-# ── Protocols ─────────────────────────────────────────────────────────────────
 
 class ScreenGeometry(Protocol):
     def x(self) -> int: ...
@@ -34,20 +24,17 @@ class Screen(Protocol):
 class Microphone(Protocol):
     def description(self) -> str: ...
 
-
-# ── RecordingSession ──────────────────────────────────────────────────────────
-
 @dataclass
 class RecordingSession:
     """
-    Pfade und gemeinsame Uhr einer Aufnahme-Session.
+    Represents a recording session that involves screen and microphone capturing.
 
-    t0 wird in RecorderService.start_recording() gesetzt, unmittelbar
-    bevor der ffmpeg-Prozess gestartet wird. Events werden relativ zu
-    t0 gestempelt:
-
-        mp4_position_ms ≈ event t_ms   (Toleranz < 100 ms)
+    This class is used to manage all aspects of a recording session, including file
+    paths, metadata generation, and session timing. It handles initialization of
+    session directories and maintains information relevant to both the screen and
+    microphone used during the session.
     """
+
     screen:     Screen
     microphone: Microphone
 
@@ -107,9 +94,6 @@ class RecordingSession:
             },
             "microphone": {"description": self.microphone.description()},
         }
-
-
-# ── EventWriter ───────────────────────────────────────────────────────────────
 
 class EventWriter:
     """Schreibt Events thread-sicher als JSON-Array."""
