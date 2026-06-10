@@ -235,7 +235,6 @@ class InputRecorder:
         self._last_move_t_ms = 0.0
         self._writer.write({"type": "input_started"}, t_ms=self._session.session_time_ms())
         self._mouse = pynput.mouse.Listener(
-            on_move=self._on_move,
             on_click=self._on_click,
             on_scroll=self._on_scroll,
         )
@@ -256,13 +255,6 @@ class InputRecorder:
             self._keyboard.stop()
             self._keyboard = None
         self._writer.write({"type": "input_stopped"}, t_ms=self._session.session_time_ms())
-
-    def _on_move(self, x: int, y: int) -> None:
-        t_ms = self._session.session_time_ms()
-        if t_ms - self._last_move_t_ms < self._THROTTLE_MS:
-            return
-        self._last_move_t_ms = t_ms
-        self._writer.write({"type": "mouse_move", "x": x, "y": y}, t_ms=t_ms)
 
     def _on_click(self, x: int, y: int, button, pressed: bool) -> None:
         self._writer.write(
