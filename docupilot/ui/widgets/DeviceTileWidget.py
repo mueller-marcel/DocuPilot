@@ -3,6 +3,10 @@ from PySide6.QtWidgets import QFrame, QLabel, QPushButton, QSizePolicy, QVBoxLay
 
 
 class DeviceTileWidget(QPushButton):
+    """
+    Represents a clickable QPushButton as a tile widget for a specific device with preview, name, and details.
+    """
+
     def __init__(
         self,
         device,

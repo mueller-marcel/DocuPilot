@@ -16,6 +16,11 @@ class RecordButtonWidget(QWidget):
     record_stopped = Signal()
 
     def __init__(self, parent: QWidget | None = None) -> None:
+        """
+        Initialize the record button widget.
+        :param parent: The parent widget.
+        """
+
         super().__init__(parent)
 
         self._button = QPushButton("Aufnahme starten")
@@ -36,6 +41,11 @@ class RecordButtonWidget(QWidget):
         layout.addStretch()
 
     def is_recording(self) -> bool:
+        """
+        Indicates whether the button is currently recording.
+        :return: True if recording, False otherwise.
+        """
+
         return self._button.isChecked()
 
     def start_recording(self) -> None:
@@ -48,6 +58,7 @@ class RecordButtonWidget(QWidget):
         """
         Set the button to stopped state without emitting record_stopped.
         """
+
         self.set_recording_state(False, emit_signal=False)
 
     def set_recording_state(self, recording: bool, emit_signal: bool = False) -> None:
@@ -57,6 +68,7 @@ class RecordButtonWidget(QWidget):
         :param recording: True for active recording UI state.
         :param emit_signal: Whether the state change should emit Qt signals.
         """
+
         if self._button.isChecked() == recording:
             return
 
@@ -77,6 +89,7 @@ class RecordButtonWidget(QWidget):
         """
         Handle real user-triggered toggle changes.
         """
+
         if checked:
             self._apply_stop_style()
             self.record_started.emit()

@@ -6,6 +6,18 @@ from PySide6.QtWidgets import QAbstractButton, QButtonGroup, QFrame, QGridLayout
 
 
 class DeviceSelectorWidget(QWidget):
+    """
+    Generic widget for selecting a device from a grid of options.
+
+    This widget allows the user to select a device from a dynamically generated
+    grid of tiles. It is designed to support various types of devices by using
+    a factory pattern for creating tile widgets and providing flexibility
+    in defining the attributes associated with the devices.
+
+    :ivar device_selected: Signal emitted when a device is selected, passing the selected device.
+    :type device_selected: Signal
+    """
+
     device_selected = Signal(object)
 
     def __init__(

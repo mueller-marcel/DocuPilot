@@ -5,6 +5,9 @@ from docupilot.ui.widgets.DeviceTileWidget import DeviceTileWidget
 
 
 class MicrophoneTileWidget(DeviceTileWidget):
+    """
+    Represents a widget for displaying and interacting with a microphone device.
+    """
     def __init__(self, microphone, parent: QWidget | None = None) -> None:
         """
         Initialize the microphone tile widget.

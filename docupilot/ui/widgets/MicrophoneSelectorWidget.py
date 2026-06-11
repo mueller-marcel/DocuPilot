@@ -7,6 +7,10 @@ from docupilot.ui.widgets.MicrophoneTileWidget import MicrophoneTileWidget
 
 
 class MicrophoneSelectorWidget(DeviceSelectorWidget):
+    """
+    Widget for selecting and displaying a list of available microphones.
+    """
+
     microphone_selected = Signal(object)
 
     def __init__(self, parent: QWidget | None = None) -> None:
