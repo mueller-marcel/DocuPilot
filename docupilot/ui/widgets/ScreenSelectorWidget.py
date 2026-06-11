@@ -6,6 +6,10 @@ from docupilot.ui.widgets.ScreenTileWidget import ScreenTileWidget
 
 
 class ScreenSelectorWidget(DeviceSelectorWidget):
+    """
+    The widget for selecting a screen.
+    """
+
     screen_selected = Signal(object)
 
     def __init__(self, parent: QWidget | None = None) -> None:

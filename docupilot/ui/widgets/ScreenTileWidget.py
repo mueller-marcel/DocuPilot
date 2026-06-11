@@ -5,6 +5,10 @@ from docupilot.ui.widgets.DeviceTileWidget import DeviceTileWidget
 
 
 class ScreenTileWidget(DeviceTileWidget):
+    """
+    Widget for displaying a tile representation of a screen.
+    """
+
     def __init__(self, screen, parent: QWidget | None = None) -> None:
         """
         Initialize the screen tile widget.
