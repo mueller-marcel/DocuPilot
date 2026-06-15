@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import json
+import math
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Optional
 
 from PySide6.QtCore import QTimer, QUrl, Qt, Signal
-from PySide6.QtGui import QColor, QPainter
+from PySide6.QtGui import QColor, QPainter, QPen, QFont, QBrush
 from PySide6.QtMultimedia import QAudioOutput, QMediaPlayer
 from PySide6.QtMultimediaWidgets import QVideoWidget
 from PySide6.QtWidgets import (
@@ -27,6 +29,13 @@ from PySide6.QtWidgets import (
 )
 
 from docupilot.recording.session import RecordingSession
+
+try:
+    import librosa
+    import numpy as np
+    _LIBROSA_AVAILABLE = True
+except ImportError:
+    _LIBROSA_AVAILABLE = False
 
 _MARKER_TYPES = {"mouse_click", "key_press", "key_release", "mouse_scroll"}
 
@@ -361,6 +370,306 @@ class _BoundaryDialog(QDialog):
         return self._boundaries
 
 
+class _RmsCanvas(QWidget):
+    """
+    Custom widget that paints the RMS energy curve on a timeline.
+    Clicking on the canvas emits a seek_requested signal (position in ms).
+    """
+
+    seek_requested = Signal(float)
+
+    _PAD_L = 52   # left padding (y-axis labels)
+    _PAD_R = 16
+    _PAD_T = 16
+    _PAD_B = 32   # bottom padding (time labels)
+
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self._rms: list[float] = []          # normalised RMS values [0..1]
+        self._duration_ms: float = 0.0
+        self._cursor_ms: float = 0.0
+        self._boundaries: list[float] = []   # boundary times in ms
+        self.setMinimumHeight(160)
+        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+        self.setCursor(Qt.CursorShape.CrossCursor)
+
+    # ------------------------------------------------------------------ data
+    def set_data(self, rms_values: list[float], duration_ms: float) -> None:
+        """Load normalised RMS values and total duration."""
+        self._rms = rms_values
+        self._duration_ms = duration_ms
+        self.update()
+
+    def set_cursor(self, pos_ms: float) -> None:
+        """Move the playback cursor line."""
+        self._cursor_ms = pos_ms
+        self.update()
+
+    def set_boundaries(self, boundaries_ms: list[float]) -> None:
+        """Show ground-truth boundary lines."""
+        self._boundaries = boundaries_ms
+        self.update()
+
+    # --------------------------------------------------------------- interaction
+    def mousePressEvent(self, event) -> None:
+        if self._duration_ms <= 0:
+            return
+        x = event.position().x()
+        frac = (x - self._PAD_L) / max(1, self.width() - self._PAD_L - self._PAD_R)
+        frac = max(0.0, min(1.0, frac))
+        self.seek_requested.emit(frac * self._duration_ms)
+
+    # --------------------------------------------------------------- painting
+    def paintEvent(self, _event) -> None:  # noqa: N802
+        if not self._rms:
+            self._paint_empty()
+            return
+
+        w = self.width()
+        h = self.height()
+        pl, pr, pt, pb = self._PAD_L, self._PAD_R, self._PAD_T, self._PAD_B
+        plot_w = w - pl - pr
+        plot_h = h - pt - pb
+
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+
+        # --- background
+        p.fillRect(0, 0, w, h, QColor("#1e1e2e"))
+        p.fillRect(pl, pt, plot_w, plot_h, QColor("#12121a"))
+
+        # --- horizontal grid lines + y-axis labels
+        grid_pen = QPen(QColor("#2a2a40"))
+        grid_pen.setWidth(1)
+        p.setPen(grid_pen)
+        label_font = QFont("monospace", 8)
+        p.setFont(label_font)
+        label_color = QColor("#666688")
+
+        for frac in (0.0, 0.25, 0.5, 0.75, 1.0):
+            y = pt + plot_h - int(frac * plot_h)
+            p.setPen(grid_pen)
+            p.drawLine(pl, y, pl + plot_w, y)
+            p.setPen(label_color)
+            p.drawText(2, y + 4, pl - 6, 12, Qt.AlignmentFlag.AlignRight, f"{frac:.2f}")
+
+        # --- time axis labels
+        n_ticks = 6
+        for i in range(n_ticks + 1):
+            frac = i / n_ticks
+            x = pl + int(frac * plot_w)
+            t_s = frac * self._duration_ms / 1000
+            p.setPen(label_color)
+            label = f"{int(t_s // 60):02d}:{t_s % 60:04.1f}"
+            p.drawText(x - 24, h - pb + 4, 48, pb - 4, Qt.AlignmentFlag.AlignHCenter, label)
+            tick_pen = QPen(QColor("#333355"))
+            tick_pen.setWidth(1)
+            p.setPen(tick_pen)
+            p.drawLine(x, pt, x, pt + plot_h)
+
+        # --- boundary lines
+        if self._duration_ms > 0:
+            for b_ms in self._boundaries:
+                bx = pl + int(b_ms / self._duration_ms * plot_w)
+                boundary_pen = QPen(QColor("#D85A30"))
+                boundary_pen.setWidth(1)
+                boundary_pen.setStyle(Qt.PenStyle.DashLine)
+                p.setPen(boundary_pen)
+                p.drawLine(bx, pt, bx, pt + plot_h)
+
+        # --- RMS curve (filled area beneath)
+        n = len(self._rms)
+        xs = [pl + int(i / (n - 1) * plot_w) for i in range(n)]
+        ys = [pt + plot_h - int(v * plot_h) for v in self._rms]
+
+        # filled gradient area
+        fill_color = QColor("#4da3ff")
+        fill_color.setAlpha(50)
+        from PySide6.QtGui import QPolygon
+        from PySide6.QtCore import QPoint
+        poly_points = [QPoint(xs[0], pt + plot_h)]
+        for x, y in zip(xs, ys):
+            poly_points.append(QPoint(x, y))
+        poly_points.append(QPoint(xs[-1], pt + plot_h))
+        p.setBrush(QBrush(fill_color))
+        p.setPen(Qt.PenStyle.NoPen)
+        poly = QPolygon(poly_points)
+        p.drawPolygon(poly)
+
+        # curve line
+        curve_pen = QPen(QColor("#4da3ff"))
+        curve_pen.setWidth(2)
+        p.setPen(curve_pen)
+        p.setBrush(Qt.BrushStyle.NoBrush)
+        for i in range(n - 1):
+            p.drawLine(xs[i], ys[i], xs[i + 1], ys[i + 1])
+
+        # --- local minima markers (potential boundaries)
+        min_pen = QPen(QColor("#1D9E75"))
+        min_pen.setWidth(1)
+        p.setPen(min_pen)
+        p.setBrush(QBrush(QColor("#1D9E75")))
+        for i in range(1, n - 1):
+            if self._rms[i] < self._rms[i - 1] and self._rms[i] < self._rms[i + 1]:
+                # only draw significant minima (below 30 % of peak)
+                if self._rms[i] < 0.30:
+                    p.drawEllipse(xs[i] - 3, ys[i] - 3, 6, 6)
+
+        # --- playback cursor
+        if self._duration_ms > 0:
+            cx = pl + int(self._cursor_ms / self._duration_ms * plot_w)
+            cursor_pen = QPen(QColor("#ffffff"))
+            cursor_pen.setWidth(2)
+            p.setPen(cursor_pen)
+            p.drawLine(cx, pt, cx, pt + plot_h)
+
+        p.end()
+
+    def _paint_empty(self) -> None:
+        p = QPainter(self)
+        p.fillRect(0, 0, self.width(), self.height(), QColor("#1e1e2e"))
+        p.setPen(QColor("#555"))
+        p.setFont(QFont("sans-serif", 11))
+        p.drawText(self.rect(), Qt.AlignmentFlag.AlignCenter, "Keine Audio-Daten verfügbar")
+        p.end()
+
+
+class _RmsVisualizerDialog(QDialog):
+    """
+    Modal dialog showing the RMS energy timeline for the current session.
+    The playback cursor is synced live with the video player.
+    Clicking on the timeline seeks the video.
+    """
+
+    def __init__(
+        self,
+        player: QMediaPlayer,
+        session_path,
+        duration_ms: float,
+        boundaries: list[dict],
+        parent: QWidget | None = None,
+    ) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("RMS-Energieverlauf · Audio-Visualisierung")
+        self.setMinimumSize(820, 340)
+        self.resize(1000, 380)
+        self.setModal(False)  # non-modal → bleibt offen beim Scrubben
+
+        self._player = player
+        self._duration_ms = duration_ms
+        self._rms_values: list[float] = []
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(14, 14, 14, 14)
+        layout.setSpacing(10)
+
+        # --- header
+        header = QLabel("RMS-Energieverlauf  ·  grüne Punkte = lokale Minima  ·  orange gestrichelt = gesetzte Grenzen")
+        header.setStyleSheet("color:#aaa; font-size:11px;")
+        layout.addWidget(header)
+
+        # --- legend row
+        legend = QHBoxLayout()
+        for color, text in [
+            ("#4da3ff", "RMS-Energie"),
+            ("#1D9E75", "Lokales Minimum (< 30 %)"),
+            ("#D85A30", "Gesetzte Grenze"),
+            ("#ffffff", "Playback-Cursor"),
+        ]:
+            dot = QLabel("●")
+            dot.setStyleSheet(f"color:{color}; font-size:14px;")
+            lbl = QLabel(text)
+            lbl.setStyleSheet("color:#888; font-size:11px; margin-right:14px;")
+            legend.addWidget(dot)
+            legend.addWidget(lbl)
+        legend.addStretch()
+        layout.addLayout(legend)
+
+        # --- canvas
+        self._canvas = _RmsCanvas()
+        self._canvas.seek_requested.connect(self._on_seek)
+        layout.addWidget(self._canvas, stretch=1)
+
+        # --- status bar
+        self._status = QLabel("Wird berechnet …")
+        self._status.setStyleSheet("color:#666; font-size:10px;")
+        layout.addWidget(self._status)
+
+        # --- close button
+        btn_row = QHBoxLayout()
+        btn_row.addStretch()
+        close_btn = QPushButton("Schließen")
+        close_btn.setStyleSheet(
+            "QPushButton{background:#fff;color:#333;border:1px solid #ccc;"
+            "border-radius:6px;padding:5px 14px;font-size:12px;}"
+            "QPushButton:hover{background:#f0f0f0;}"
+        )
+        close_btn.clicked.connect(self.accept)
+        btn_row.addWidget(close_btn)
+        layout.addLayout(btn_row)
+
+        # set boundaries
+        b_ms = [b.get("t_ms", 0.0) for b in boundaries]
+        self._canvas.set_boundaries(b_ms)
+
+        # live cursor timer
+        self._timer = QTimer(self)
+        self._timer.setInterval(80)
+        self._timer.timeout.connect(self._sync_cursor)
+        self._timer.start()
+
+        # load rms asynchronously via QTimer (keeps UI responsive)
+        self._session_path = session_path
+        QTimer.singleShot(50, lambda: self._compute_rms())
+
+    def _compute_rms(self) -> None:
+        """Extract RMS from the audio file and hand it to the canvas."""
+        if not _LIBROSA_AVAILABLE:
+            self._status.setText("librosa nicht installiert – bitte 'pip install librosa' ausführen.")
+            return
+
+        try:
+            import numpy as np
+            audio, sr = librosa.load(str(self._session_path), mono=True)
+            rms = librosa.feature.rms(y=audio, hop_length=512)[0]  # shape (T,)
+
+            # normalise to [0, 1]
+            peak = float(rms.max()) if rms.max() > 0 else 1.0
+            normalised = (rms / peak).tolist()
+            self._rms_values = normalised
+            self._canvas.set_data(normalised, self._duration_ms)
+
+            # stats for status bar
+            mean_val = float(np.mean(rms))
+            n_minima = sum(
+                1 for i in range(1, len(normalised) - 1)
+                if normalised[i] < normalised[i - 1]
+                and normalised[i] < normalised[i + 1]
+                and normalised[i] < 0.30
+            )
+            hop_ms = 512 / (sr / 1000)
+            self._status.setText(
+                f"  {len(normalised)} Frames  ·  Fenster ~{hop_ms:.0f} ms  ·  "
+                f"Ø RMS {mean_val:.4f}  ·  {n_minima} lokale Minima (< 30 % Peak)"
+            )
+        except Exception as exc:
+            self._status.setText(f"Fehler beim Laden: {exc}")
+
+    def _sync_cursor(self) -> None:
+        pos = float(self._player.position())
+        self._canvas.set_cursor(pos)
+
+    def _on_seek(self, ms: float) -> None:
+        self._player.setPosition(int(ms))
+        if self._player.playbackState() != QMediaPlayer.PlaybackState.PlayingState:
+            self._player.play()
+            self._player.pause()
+
+    def closeEvent(self, event) -> None:
+        self._timer.stop()
+        super().closeEvent(event)
+
+
 class AnnotationWindow(QWidget):
     """
     Annotation page shown after a recording has been stopped.
@@ -383,6 +692,7 @@ class AnnotationWindow(QWidget):
         self._boundaries: list[dict] = []
         self._boundary_path: Path | None = None
         self._duration_ms: float = 0.0
+        self._rms_dialog: _RmsVisualizerDialog | None = None
 
         self._player = QMediaPlayer(self)
         self._audio = QAudioOutput(self)
@@ -509,6 +819,20 @@ class AnnotationWindow(QWidget):
         layout.addSpacing(8)
         layout.addWidget(dir_container)
         layout.addStretch()
+
+        self._rms_button = QPushButton("♪  RMS-Verlauf")
+        self._rms_button.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._rms_button.setToolTip("Energieverlauf der Stimme auf Zeitleiste anzeigen")
+        self._rms_button.setStyleSheet(
+            "QPushButton{background:#e8f0fe;color:#1a6fc4;border:1px solid #c5d8f6;"
+            "border-radius:5px;font-size:12px;font-weight:600;padding:0 12px;}"
+            "QPushButton:hover{background:#d0e4ff;border-color:#4da3ff;}"
+            "QPushButton:pressed{background:#bdd4f8;}"
+        )
+        self._rms_button.clicked.connect(self._show_rms_visualizer)
+        layout.addWidget(self._rms_button)
+        layout.addSpacing(6)
+
         layout.addWidget(self._boundary_count_label)
         return toolbar
 
@@ -866,6 +1190,27 @@ class AnnotationWindow(QWidget):
             "QPushButton:hover{background:#ffe8de;}"
             "QPushButton:pressed{background:#ffd6c4;}"
         )
+
+    def _show_rms_visualizer(self) -> None:
+        """
+        Open (or re-focus) the RMS energy visualizer dialog for the current session.
+        """
+        if self._session is None:
+            return
+
+        # close stale dialog if session changed
+        if self._rms_dialog is not None:
+            self._rms_dialog.close()
+            self._rms_dialog = None
+
+        self._rms_dialog = _RmsVisualizerDialog(
+            player=self._player,
+            session_path=self._session.recording_path,
+            duration_ms=self._duration_ms,
+            boundaries=self._boundaries,
+            parent=self,
+        )
+        self._rms_dialog.show()
 
     def _on_back(self) -> None:
         """
