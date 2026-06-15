@@ -370,33 +370,52 @@ class _BoundaryDialog(QDialog):
         return self._boundaries
 
 
-class _RmsCanvas(QWidget):
+# Feature-Gruppen: (Label, Spaltenbereich, Farbe, Fill)
+_FEATURE_TRACKS: list[tuple[str, slice, str, bool]] = [
+    ("MFCC Ø",    slice(0, 13),  "#4da3ff", True),   # blau  – mittlerer MFCC-Wert
+    ("Δ Ø",       slice(13, 26), "#a78bfa", False),  # lila  – erster Delta
+    ("ΔΔ Ø",      slice(26, 39), "#34d399", False),  # grün  – zweiter Delta
+    ("RMS",       slice(39, 40), "#f97316", True),   # orange – Energie
+]
+
+
+class _FeatureCanvas(QWidget):
     """
-    Custom widget that paints the RMS energy curve on a timeline.
-    Clicking on the canvas emits a seek_requested signal (position in ms).
+    Paints up to 4 normalised feature curves on a shared timeline.
+    Each curve corresponds to one feature group from the 40-dim vector:
+      cols 0–12  → MFCC (mean across coefficients)
+      cols 13–25 → Δ    (mean)
+      cols 26–38 → ΔΔ   (mean)
+      col  39    → RMS
+    Clicking seeks the video player.
     """
 
     seek_requested = Signal(float)
 
-    _PAD_L = 52   # left padding (y-axis labels)
+    _PAD_L = 52
     _PAD_R = 16
     _PAD_T = 16
-    _PAD_B = 32   # bottom padding (time labels)
+    _PAD_B = 32
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
-        self._rms: list[float] = []          # normalised RMS values [0..1]
+        # Each entry: (label, normalised values [0..1], hex color, fill flag)
+        self._tracks: list[tuple[str, list[float], str, bool]] = []
         self._duration_ms: float = 0.0
         self._cursor_ms: float = 0.0
-        self._boundaries: list[float] = []   # boundary times in ms
+        self._boundaries: list[float] = []
         self.setMinimumHeight(160)
         self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
         self.setCursor(Qt.CursorShape.CrossCursor)
 
     # ------------------------------------------------------------------ data
-    def set_data(self, rms_values: list[float], duration_ms: float) -> None:
-        """Load normalised RMS values and total duration."""
-        self._rms = rms_values
+    def set_data(self, tracks: list[tuple[str, list[float], str, bool]], duration_ms: float) -> None:
+        """
+        Load feature tracks.
+        :param tracks: list of (label, normalised_values, hex_color, fill)
+        :param duration_ms: total recording duration in milliseconds
+        """
+        self._tracks = tracks
         self._duration_ms = duration_ms
         self.update()
 
@@ -421,9 +440,12 @@ class _RmsCanvas(QWidget):
 
     # --------------------------------------------------------------- painting
     def paintEvent(self, _event) -> None:  # noqa: N802
-        if not self._rms:
+        if not self._tracks:
             self._paint_empty()
             return
+
+        from PySide6.QtGui import QPolygon
+        from PySide6.QtCore import QPoint
 
         w = self.width()
         h = self.height()
@@ -438,14 +460,13 @@ class _RmsCanvas(QWidget):
         p.fillRect(0, 0, w, h, QColor("#1e1e2e"))
         p.fillRect(pl, pt, plot_w, plot_h, QColor("#12121a"))
 
-        # --- horizontal grid lines + y-axis labels
-        grid_pen = QPen(QColor("#2a2a40"))
-        grid_pen.setWidth(1)
-        p.setPen(grid_pen)
         label_font = QFont("monospace", 8)
         p.setFont(label_font)
         label_color = QColor("#666688")
+        grid_pen = QPen(QColor("#2a2a40"))
+        grid_pen.setWidth(1)
 
+        # --- horizontal grid + y-axis labels
         for frac in (0.0, 0.25, 0.5, 0.75, 1.0):
             y = pt + plot_h - int(frac * plot_h)
             p.setPen(grid_pen)
@@ -453,7 +474,7 @@ class _RmsCanvas(QWidget):
             p.setPen(label_color)
             p.drawText(2, y + 4, pl - 6, 12, Qt.AlignmentFlag.AlignRight, f"{frac:.2f}")
 
-        # --- time axis labels
+        # --- time axis labels + vertical grid
         n_ticks = 6
         for i in range(n_ticks + 1):
             frac = i / n_ticks
@@ -477,43 +498,43 @@ class _RmsCanvas(QWidget):
                 p.setPen(boundary_pen)
                 p.drawLine(bx, pt, bx, pt + plot_h)
 
-        # --- RMS curve (filled area beneath)
-        n = len(self._rms)
-        xs = [pl + int(i / (n - 1) * plot_w) for i in range(n)]
-        ys = [pt + plot_h - int(v * plot_h) for v in self._rms]
+        # --- feature curves
+        for label, values, hex_color, do_fill in self._tracks:
+            n = len(values)
+            if n < 2:
+                continue
+            xs = [pl + int(i / (n - 1) * plot_w) for i in range(n)]
+            ys = [pt + plot_h - int(v * plot_h) for v in values]
 
-        # filled gradient area
-        fill_color = QColor("#4da3ff")
-        fill_color.setAlpha(50)
-        from PySide6.QtGui import QPolygon
-        from PySide6.QtCore import QPoint
-        poly_points = [QPoint(xs[0], pt + plot_h)]
-        for x, y in zip(xs, ys):
-            poly_points.append(QPoint(x, y))
-        poly_points.append(QPoint(xs[-1], pt + plot_h))
-        p.setBrush(QBrush(fill_color))
-        p.setPen(Qt.PenStyle.NoPen)
-        poly = QPolygon(poly_points)
-        p.drawPolygon(poly)
+            # optional filled area
+            if do_fill:
+                fill_color = QColor(hex_color)
+                fill_color.setAlpha(35)
+                poly_points = [QPoint(xs[0], pt + plot_h)]
+                for x, y in zip(xs, ys):
+                    poly_points.append(QPoint(x, y))
+                poly_points.append(QPoint(xs[-1], pt + plot_h))
+                p.setBrush(QBrush(fill_color))
+                p.setPen(Qt.PenStyle.NoPen)
+                p.drawPolygon(QPolygon(poly_points))
 
-        # curve line
-        curve_pen = QPen(QColor("#4da3ff"))
-        curve_pen.setWidth(2)
-        p.setPen(curve_pen)
-        p.setBrush(Qt.BrushStyle.NoBrush)
-        for i in range(n - 1):
-            p.drawLine(xs[i], ys[i], xs[i + 1], ys[i + 1])
+            # curve line
+            curve_pen = QPen(QColor(hex_color))
+            curve_pen.setWidth(2)
+            p.setPen(curve_pen)
+            p.setBrush(Qt.BrushStyle.NoBrush)
+            for i in range(n - 1):
+                p.drawLine(xs[i], ys[i], xs[i + 1], ys[i + 1])
 
-        # --- local minima markers (potential boundaries)
-        min_pen = QPen(QColor("#1D9E75"))
-        min_pen.setWidth(1)
-        p.setPen(min_pen)
-        p.setBrush(QBrush(QColor("#1D9E75")))
-        for i in range(1, n - 1):
-            if self._rms[i] < self._rms[i - 1] and self._rms[i] < self._rms[i + 1]:
-                # only draw significant minima (below 30 % of peak)
-                if self._rms[i] < 0.30:
-                    p.drawEllipse(xs[i] - 3, ys[i] - 3, 6, 6)
+            # RMS-only: mark significant local minima
+            if label == "RMS":
+                min_pen = QPen(QColor(hex_color))
+                min_pen.setWidth(1)
+                p.setPen(min_pen)
+                p.setBrush(QBrush(QColor(hex_color)))
+                for i in range(1, n - 1):
+                    if values[i] < values[i - 1] and values[i] < values[i + 1] and values[i] < 0.30:
+                        p.drawEllipse(xs[i] - 3, ys[i] - 3, 6, 6)
 
         # --- playback cursor
         if self._duration_ms > 0:
@@ -536,64 +557,88 @@ class _RmsCanvas(QWidget):
 
 class _RmsVisualizerDialog(QDialog):
     """
-    Modal dialog showing the RMS energy timeline for the current session.
-    The playback cursor is synced live with the video player.
-    Clicking on the timeline seeks the video.
+    Non-modal dialog with one dedicated timeline per audio feature group:
+      • MFCC Ø   (cols 0–12)
+      • Δ Ø      (cols 13–25)
+      • ΔΔ Ø     (cols 26–38)
+      • RMS      (col 39)
+    All timelines share the same playback-cursor needle and boundary lines.
+    Clicking any timeline seeks the video player.
     """
 
     def __init__(
         self,
         player: QMediaPlayer,
-        session_path,
+        session: RecordingSession,
         duration_ms: float,
         boundaries: list[dict],
         parent: QWidget | None = None,
     ) -> None:
         super().__init__(parent)
-        self.setWindowTitle("RMS-Energieverlauf · Audio-Visualisierung")
-        self.setMinimumSize(820, 340)
-        self.resize(1000, 380)
-        self.setModal(False)  # non-modal → bleibt offen beim Scrubben
+        self.setWindowTitle("Audio-Feature-Verlauf · Visualisierung")
+        self.setMinimumSize(820, 600)
+        self.resize(1100, 780)
+        self.setModal(False)
 
         self._player = player
+        self._session = session
         self._duration_ms = duration_ms
-        self._rms_values: list[float] = []
+        self._boundaries_ms = [b.get("t_ms", 0.0) for b in boundaries]
 
-        layout = QVBoxLayout(self)
-        layout.setContentsMargins(14, 14, 14, 14)
-        layout.setSpacing(10)
+        # one canvas per track, built alongside the layout
+        self._canvases: list[_FeatureCanvas] = []
+
+        root = QVBoxLayout(self)
+        root.setContentsMargins(14, 14, 14, 10)
+        root.setSpacing(8)
 
         # --- header
-        header = QLabel("RMS-Energieverlauf  ·  grüne Punkte = lokale Minima  ·  orange gestrichelt = gesetzte Grenzen")
+        header = QLabel(
+            "Audio-Features aus extract_audio_features()  ·  "
+            "Punkte = RMS-Minima  ·  gestrichelt = gesetzte Grenzen  ·  "
+            "Klick auf Timeline → Sprung im Video"
+        )
         header.setStyleSheet("color:#aaa; font-size:11px;")
-        layout.addWidget(header)
+        root.addWidget(header)
 
-        # --- legend row
-        legend = QHBoxLayout()
-        for color, text in [
-            ("#4da3ff", "RMS-Energie"),
-            ("#1D9E75", "Lokales Minimum (< 30 %)"),
-            ("#D85A30", "Gesetzte Grenze"),
-            ("#ffffff", "Playback-Cursor"),
-        ]:
-            dot = QLabel("●")
-            dot.setStyleSheet(f"color:{color}; font-size:14px;")
-            lbl = QLabel(text)
-            lbl.setStyleSheet("color:#888; font-size:11px; margin-right:14px;")
-            legend.addWidget(dot)
-            legend.addWidget(lbl)
-        legend.addStretch()
-        layout.addLayout(legend)
+        # --- scrollable area containing one lane per track
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.Shape.NoFrame)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        scroll.setStyleSheet("background:#1e1e2e;")
 
-        # --- canvas
-        self._canvas = _RmsCanvas()
-        self._canvas.seek_requested.connect(self._on_seek)
-        layout.addWidget(self._canvas, stretch=1)
+        lanes_widget = QWidget()
+        lanes_widget.setStyleSheet("background:#1e1e2e;")
+        lanes_layout = QVBoxLayout(lanes_widget)
+        lanes_layout.setContentsMargins(0, 0, 0, 0)
+        lanes_layout.setSpacing(2)
+
+        for label, _col_slice, hex_color, _do_fill in _FEATURE_TRACKS:
+            # track header label
+            track_label = QLabel(f"  {label}")
+            track_label.setFixedHeight(22)
+            track_label.setStyleSheet(
+                f"color:{hex_color}; font-size:11px; font-weight:600; "
+                f"background:#1e1e2e; border-left:3px solid {hex_color}; padding-left:6px;"
+            )
+            lanes_layout.addWidget(track_label)
+
+            canvas = _FeatureCanvas()
+            canvas.setFixedHeight(140)
+            canvas.set_boundaries(self._boundaries_ms)
+            canvas.seek_requested.connect(self._on_seek)
+            lanes_layout.addWidget(canvas)
+            self._canvases.append(canvas)
+
+        lanes_layout.addStretch()
+        scroll.setWidget(lanes_widget)
+        root.addWidget(scroll, stretch=1)
 
         # --- status bar
         self._status = QLabel("Wird berechnet …")
         self._status.setStyleSheet("color:#666; font-size:10px;")
-        layout.addWidget(self._status)
+        root.addWidget(self._status)
 
         # --- close button
         btn_row = QHBoxLayout()
@@ -606,58 +651,67 @@ class _RmsVisualizerDialog(QDialog):
         )
         close_btn.clicked.connect(self.accept)
         btn_row.addWidget(close_btn)
-        layout.addLayout(btn_row)
+        root.addLayout(btn_row)
 
-        # set boundaries
-        b_ms = [b.get("t_ms", 0.0) for b in boundaries]
-        self._canvas.set_boundaries(b_ms)
-
-        # live cursor timer
+        # live cursor – broadcasts to all canvases
         self._timer = QTimer(self)
         self._timer.setInterval(80)
         self._timer.timeout.connect(self._sync_cursor)
         self._timer.start()
 
-        # load rms asynchronously via QTimer (keeps UI responsive)
-        self._session_path = session_path
-        QTimer.singleShot(50, lambda: self._compute_rms())
+        # compute features asynchronously so the dialog opens instantly
+        QTimer.singleShot(50, self._compute_features)
 
-    def _compute_rms(self) -> None:
-        """Extract RMS from the audio file and hand it to the canvas."""
-        if not _LIBROSA_AVAILABLE:
-            self._status.setText("librosa nicht installiert – bitte 'pip install librosa' ausführen.")
-            return
-
+    # ------------------------------------------------------------------ feature computation
+    def _compute_features(self) -> None:
+        """
+        Call AudioFeatureExtractor.extract_audio_features() and push one
+        normalised signal per feature group to its dedicated canvas.
+        """
         try:
+            from docupilot.segmentation.feature_extraction import AudioFeatureExtractor
             import numpy as np
-            audio, sr = librosa.load(str(self._session_path), mono=True)
-            rms = librosa.feature.rms(y=audio, hop_length=512)[0]  # shape (T,)
 
-            # normalise to [0, 1]
-            peak = float(rms.max()) if rms.max() > 0 else 1.0
-            normalised = (rms / peak).tolist()
-            self._rms_values = normalised
-            self._canvas.set_data(normalised, self._duration_ms)
+            # shape (T, 40)
+            features: np.ndarray = AudioFeatureExtractor.extract_audio_features(self._session)
 
-            # stats for status bar
-            mean_val = float(np.mean(rms))
+            for canvas, (_label, col_slice, hex_color, do_fill) in zip(
+                self._canvases, _FEATURE_TRACKS
+            ):
+                group = features[:, col_slice]
+                signal = np.mean(np.abs(group), axis=1) if group.shape[1] > 1 else group[:, 0]
+
+                peak = float(signal.max()) if signal.max() > 0 else 1.0
+                normalised = (signal / peak).tolist()
+
+                # _FeatureCanvas.set_data expects list of track tuples
+                canvas.set_data(
+                    [(_label, normalised, hex_color, do_fill)],
+                    self._duration_ms,
+                )
+
+            # status line
+            T = features.shape[0]
+            rms_raw = features[:, 39]
             n_minima = sum(
-                1 for i in range(1, len(normalised) - 1)
-                if normalised[i] < normalised[i - 1]
-                and normalised[i] < normalised[i + 1]
-                and normalised[i] < 0.30
+                1 for i in range(1, T - 1)
+                if rms_raw[i] < rms_raw[i - 1]
+                and rms_raw[i] < rms_raw[i + 1]
+                and rms_raw[i] < 0.30 * float(rms_raw.max())
             )
-            hop_ms = 512 / (sr / 1000)
+            hop_ms = (self._duration_ms / T) if T > 0 else 0
             self._status.setText(
-                f"  {len(normalised)} Frames  ·  Fenster ~{hop_ms:.0f} ms  ·  "
-                f"Ø RMS {mean_val:.4f}  ·  {n_minima} lokale Minima (< 30 % Peak)"
+                f"  {T} Frames  ·  ~{hop_ms:.0f} ms/Frame  ·  "
+                f"Ø RMS {float(np.mean(rms_raw)):.4f}  ·  {n_minima} RMS-Minima (< 30 % Peak)"
             )
         except Exception as exc:
-            self._status.setText(f"Fehler beim Laden: {exc}")
+            self._status.setText(f"Fehler beim Berechnen: {exc}")
 
+    # ------------------------------------------------------------------ slots
     def _sync_cursor(self) -> None:
         pos = float(self._player.position())
-        self._canvas.set_cursor(pos)
+        for canvas in self._canvases:
+            canvas.set_cursor(pos)
 
     def _on_seek(self, ms: float) -> None:
         self._player.setPosition(int(ms))
@@ -1205,7 +1259,7 @@ class AnnotationWindow(QWidget):
 
         self._rms_dialog = _RmsVisualizerDialog(
             player=self._player,
-            session_path=self._session.recording_path,
+            session=self._session,
             duration_ms=self._duration_ms,
             boundaries=self._boundaries,
             parent=self,
