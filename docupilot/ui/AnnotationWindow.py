@@ -1,10 +1,8 @@
 from __future__ import annotations
 
 import json
-import math
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Optional
 
 from PySide6.QtCore import QTimer, QUrl, Qt, Signal
 from PySide6.QtGui import QColor, QPainter, QPen, QFont, QBrush
@@ -370,23 +368,36 @@ class _BoundaryDialog(QDialog):
         return self._boundaries
 
 
-# Feature-Gruppen: (Label, Spaltenbereich, Farbe, Fill)
+# Einheitliche Farben pro Modalität, statt einer Einzelfarbe je Feature --
+# macht auf den ersten Blick klar, was Audio, was Video und was ein Event ist.
+_AUDIO_COLOR = "#ef4444"  # rot     – alle Audio-Feature-Kurven
+_VIDEO_COLOR = "#22c55e"  # grün    – alle Video-Feature-Kurven
+_EVENT_COLOR = "#38bdf8"  # hellblau – Event-Marker (Klick/Taste/Scroll)
+
+# Feature-Gruppen aus dem 5-dim Vektor: (Label, Spaltenbereich, Farbe, Fill)
 _FEATURE_TRACKS: list[tuple[str, slice, str, bool]] = [
-    ("MFCC Ø",    slice(0, 13),  "#4da3ff", True),   # blau  – mittlerer MFCC-Wert
-    ("Δ Ø",       slice(13, 26), "#a78bfa", False),  # lila  – erster Delta
-    ("ΔΔ Ø",      slice(26, 39), "#34d399", False),  # grün  – zweiter Delta
-    ("RMS",       slice(39, 40), "#f97316", True),   # orange – Energie
+    ("RMS  (roh)", slice(0, 1), _AUDIO_COLOR, True),
+    ("Pausendauer", slice(1, 2), _AUDIO_COLOR, True),
+    ("Pitch-Reset", slice(2, 3), _AUDIO_COLOR, True),
+    ("Energie-Sprung", slice(3, 4), _AUDIO_COLOR, True),
+    ("Sprechtempo", slice(4, 5), _AUDIO_COLOR, True),
+]
+
+# Feature-Gruppen aus dem 5-dim Video-Vektor: (Label, Spaltenindex, Farbe, Fill)
+_VIDEO_FEATURE_TRACKS: list[tuple[str, int, str, bool]] = [
+    ("ECR  (Kanten-änderung)",    0, _VIDEO_COLOR, True),
+    ("ARR  (Flächen-änderung)",   1, _VIDEO_COLOR, True),
+    ("pHash (Struktur-änderung)", 2, _VIDEO_COLOR, True),
+    ("SSIM  (Wahrnehmung)",       3, _VIDEO_COLOR, True),
+    ("ROI   (Titelleiste)",       4, _VIDEO_COLOR, True),
 ]
 
 
 class _FeatureCanvas(QWidget):
     """
-    Paints up to 4 normalised feature curves on a shared timeline.
-    Each curve corresponds to one feature group from the 40-dim vector:
-      cols 0–12  → MFCC (mean across coefficients)
-      cols 13–25 → Δ    (mean)
-      cols 26–38 → ΔΔ   (mean)
-      col  39    → RMS
+    Paints a normalised feature curve on a shared timeline.
+    Used here for one column of the 5-dim Audio-Feature-Vektor at a time
+    (siehe _FEATURE_TRACKS für die Zuordnung Spalte → Lane).
     Clicking seeks the video player.
     """
 
@@ -404,6 +415,8 @@ class _FeatureCanvas(QWidget):
         self._duration_ms: float = 0.0
         self._cursor_ms: float = 0.0
         self._boundaries: list[float] = []
+        # Each entry: (t_ms, event_type) – rendered as small colored dots near the top
+        self._events: list[tuple[float, str]] = []
         self.setMinimumHeight(160)
         self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
         self.setCursor(Qt.CursorShape.CrossCursor)
@@ -429,6 +442,15 @@ class _FeatureCanvas(QWidget):
         self._boundaries = boundaries_ms
         self.update()
 
+    def set_events(self, events: list[tuple[float, str]]) -> None:
+        """
+        Show event markers (clicks, key presses, scrolls) as small dots
+        near the top of the lane, colored per event type.
+        :param events: list of (t_ms, event_type)
+        """
+        self._events = events
+        self.update()
+
     # --------------------------------------------------------------- interaction
     def mousePressEvent(self, event) -> None:
         if self._duration_ms <= 0:
@@ -440,7 +462,7 @@ class _FeatureCanvas(QWidget):
 
     # --------------------------------------------------------------- painting
     def paintEvent(self, _event) -> None:  # noqa: N802
-        if not self._tracks:
+        if not self._tracks and not self._events:
             self._paint_empty()
             return
 
@@ -544,6 +566,20 @@ class _FeatureCanvas(QWidget):
             p.setPen(cursor_pen)
             p.drawLine(cx, pt, cx, pt + plot_h)
 
+        # --- event markers: hellblaue Punkte. Auf einer reinen Event-Spur
+        # (keine Kurven, z.B. die dedizierte Event-Zeitleiste) mittig und
+        # größer; auf einer Kurven-Spur klein am oberen Rand, falls doch mal
+        # set_events() zusätzlich zu Kurvendaten gesetzt wird.
+        if self._duration_ms > 0 and self._events:
+            is_event_only_lane = not self._tracks
+            marker_y = pt + plot_h / 2 if is_event_only_lane else pt + 6
+            radius = 4 if is_event_only_lane else 3
+            p.setPen(Qt.PenStyle.NoPen)
+            p.setBrush(QBrush(QColor(_EVENT_COLOR)))
+            for ev_ms, _ev_type in self._events:
+                ex = pl + int(ev_ms / self._duration_ms * plot_w)
+                p.drawEllipse(int(ex - radius), int(marker_y - radius), radius * 2, radius * 2)
+
         p.end()
 
     def _paint_empty(self) -> None:
@@ -557,13 +593,19 @@ class _FeatureCanvas(QWidget):
 
 class _RmsVisualizerDialog(QDialog):
     """
-    Non-modal dialog with one dedicated timeline per audio feature group:
-      • MFCC Ø   (cols 0–12)
-      • Δ Ø      (cols 13–25)
-      • ΔΔ Ø     (cols 26–38)
-      • RMS      (col 39)
-    All timelines share the same playback-cursor needle and boundary lines.
-    Clicking any timeline seeks the video player.
+    Non-modal dialog with one dedicated timeline per Audio-Feature.
+
+    Tracks from extract_audio_features() (5-dim vector):
+      • RMS roh        (col 0) – rohe Lautstärke/Energie pro Zeitfenster
+      • Pausendauer    (col 1) – Dauer der aktuellen Sprechpause in Sekunden
+      • Pitch-Reset    (col 2) – |Δ Median-F0| vor/nach einer Pause
+      • Energie-Sprung (col 3) – |Δ mittlere RMS-Energie| vor/nach einer Pause
+      • Sprechtempo    (col 4) – lokale Silbenrate über Envelope-Peaks
+
+    The timeline shares the playback-cursor needle and boundary lines.
+    Event-Marker (Klick/Taste/Scroll) kommen bereits fertig extrahiert von
+    EventFeatureExtractor.extract_event_markers() herein.
+    Clicking the timeline seeks the video player.
     """
 
     def __init__(
@@ -572,12 +614,13 @@ class _RmsVisualizerDialog(QDialog):
         session: RecordingSession,
         duration_ms: float,
         boundaries: list[dict],
+        event_markers: list[tuple[float, str]] | None = None,
         parent: QWidget | None = None,
     ) -> None:
         super().__init__(parent)
-        self.setWindowTitle("Audio-Feature-Verlauf · Visualisierung")
-        self.setMinimumSize(820, 600)
-        self.resize(1100, 780)
+        self.setWindowTitle("Feature-Verläufe · Audio & Video · Visualisierung")
+        self.setMinimumSize(820, 700)
+        self.resize(1100, 950)
         self.setModal(False)
 
         self._player = player
@@ -585,7 +628,12 @@ class _RmsVisualizerDialog(QDialog):
         self._duration_ms = duration_ms
         self._boundaries_ms = [b.get("t_ms", 0.0) for b in boundaries]
 
-        # one canvas per track, built alongside the layout
+        # Bereits durch EventFeatureExtractor.extract_event_markers() auf
+        # die markanten Typen gefiltert und sortiert (siehe AnnotationWindow).
+        self._event_markers: list[tuple[float, str]] = event_markers or []
+
+        # canvases for the audio-feature tracks (currently 5-dim) + future
+        # video-/event-feature tracks, in display order
         self._canvases: list[_FeatureCanvas] = []
 
         root = QVBoxLayout(self)
@@ -594,14 +642,13 @@ class _RmsVisualizerDialog(QDialog):
 
         # --- header
         header = QLabel(
-            "Audio-Features aus extract_audio_features()  ·  "
-            "Punkte = RMS-Minima  ·  gestrichelt = gesetzte Grenzen  ·  "
-            "Klick auf Timeline → Sprung im Video"
+            "Audio-Features (rot) + Video-Features (grün)  ·  gestrichelt = gesetzte Grenzen  ·  "
+            "eigene Zeitleiste unten = Events (hellblau)  ·  Klick auf Timeline → Sprung im Video"
         )
         header.setStyleSheet("color:#aaa; font-size:11px;")
         root.addWidget(header)
 
-        # --- scrollable area containing one lane per track
+        # --- scrollable lanes
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
         scroll.setFrameShape(QFrame.Shape.NoFrame)
@@ -614,22 +661,68 @@ class _RmsVisualizerDialog(QDialog):
         lanes_layout.setContentsMargins(0, 0, 0, 0)
         lanes_layout.setSpacing(2)
 
-        for label, _col_slice, hex_color, _do_fill in _FEATURE_TRACKS:
-            # track header label
-            track_label = QLabel(f"  {label}")
-            track_label.setFixedHeight(22)
-            track_label.setStyleSheet(
+        def _add_lane(label: str, hex_color: str, do_fill: bool, *, height: int = 140) -> _FeatureCanvas:
+            lbl = QLabel(f"  {label}")
+            lbl.setFixedHeight(22)
+            lbl.setStyleSheet(
                 f"color:{hex_color}; font-size:11px; font-weight:600; "
                 f"background:#1e1e2e; border-left:3px solid {hex_color}; padding-left:6px;"
             )
-            lanes_layout.addWidget(track_label)
+            lanes_layout.addWidget(lbl)
+            c = _FeatureCanvas()
+            c.setFixedHeight(height)
+            c.set_boundaries(self._boundaries_ms)
+            c.seek_requested.connect(self._on_seek)
+            lanes_layout.addWidget(c)
+            self._canvases.append(c)
+            return c
 
-            canvas = _FeatureCanvas()
-            canvas.setFixedHeight(140)
-            canvas.set_boundaries(self._boundaries_ms)
-            canvas.seek_requested.connect(self._on_seek)
-            lanes_layout.addWidget(canvas)
-            self._canvases.append(canvas)
+        # Audio-Feature-Tracks (aus dem 5-dim Vektor)
+        self._n_audio_tracks = len(_FEATURE_TRACKS)
+        for _label, _col_slice, hex_color, do_fill in _FEATURE_TRACKS:
+            _add_lane(_label, hex_color, do_fill)
+
+        # —— Trennlinie zwischen Audio- und Video-Sektion ——
+        separator = QFrame()
+        separator.setFrameShape(QFrame.Shape.HLine)
+        separator.setStyleSheet("color:#333355; margin:6px 0;")
+        lanes_layout.addWidget(separator)
+        vid_header = QLabel("  ►  Video-Features (ECR / ARR / pHash / SSIM / ROI)")
+        vid_header.setFixedHeight(24)
+        vid_header.setStyleSheet(
+            "color:#aaa; font-size:11px; font-style:italic; background:#1e1e2e; padding-left:6px;"
+        )
+        lanes_layout.addWidget(vid_header)
+
+        # Video-Feature-Tracks (aus dem 3-dim Vektor)
+        self._n_video_tracks = len(_VIDEO_FEATURE_TRACKS)
+        for _label, _col_idx, hex_color, do_fill in _VIDEO_FEATURE_TRACKS:
+            _add_lane(_label, hex_color, do_fill)
+
+        # —— Trennlinie + eigene Event-Zeitleiste ——
+        # Bewusst getrennt von den Feature-Kurven: vorher saßen die
+        # Event-Punkte mit auf jeder einzelnen Spur, das wurde schnell
+        # unübersichtlich. Jetzt gibt es eine eigene Zeile, genauso
+        # aufgebaut wie die Audio-/Video-Spuren (gleiche Höhe, gleicher
+        # set_data()-Mechanismus für die Dauer) – nur ohne Kurve, dafür
+        # mit den Event-Punkten.
+        separator_events = QFrame()
+        separator_events.setFrameShape(QFrame.Shape.HLine)
+        separator_events.setStyleSheet("color:#333355; margin:6px 0;")
+        lanes_layout.addWidget(separator_events)
+        event_header = QLabel("  ►  Events (Klick / Taste / Scroll)")
+        event_header.setFixedHeight(24)
+        event_header.setStyleSheet(
+            "color:#aaa; font-size:11px; font-style:italic; background:#1e1e2e; padding-left:6px;"
+        )
+        lanes_layout.addWidget(event_header)
+
+        self._event_canvas = _add_lane("Events", _EVENT_COLOR, False)
+        # set_data() wie bei den anderen Spuren – ohne diesen Aufruf bleibt
+        # _duration_ms auf 0 und die Zeitleiste (inkl. der Punkte) wird
+        # nie gezeichnet, da paintEvent() darauf prüft.
+        self._event_canvas.set_data([], self._duration_ms)
+        self._event_canvas.set_events(self._event_markers)
 
         lanes_layout.addStretch()
         scroll.setWidget(lanes_widget)
@@ -659,50 +752,83 @@ class _RmsVisualizerDialog(QDialog):
         self._timer.timeout.connect(self._sync_cursor)
         self._timer.start()
 
-        # compute features asynchronously so the dialog opens instantly
         QTimer.singleShot(50, self._compute_features)
 
     # ------------------------------------------------------------------ feature computation
     def _compute_features(self) -> None:
         """
-        Call AudioFeatureExtractor.extract_audio_features() and push one
-        normalised signal per feature group to its dedicated canvas.
+        Populate all canvas lanes.
+
+        Audio-Tracks (5-dim Vektor): RMS, Pausendauer, Pitch-Reset,
+        Energie-Sprung, Sprechtempo.
+
+        Video-Tracks (5-dim Vektor): ECR, ARR, pHash, SSIM, ROI.
+        Video-Features werden auf die Audio-Zeitachse (T_audio Frames)
+        interpoliert, damit beide Sections dieselbe Zeitbasis teilen.
         """
         try:
-            from docupilot.segmentation.feature_extraction import AudioFeatureExtractor
+            from docupilot.segmentation.feature_extraction import (
+                AudioFeatureExtractor,
+                VideoFeatureExtractor,
+            )
             import numpy as np
 
-            # shape (T, 40)
-            features: np.ndarray = AudioFeatureExtractor.extract_audio_features(self._session)
+            # ── Audio-Features (T_a, 5) ─────────────────────────────
+            audio_features: np.ndarray = AudioFeatureExtractor.extract_audio_features(
+                self._session
+            )
+            T_a = audio_features.shape[0]
 
-            for canvas, (_label, col_slice, hex_color, do_fill) in zip(
-                self._canvases, _FEATURE_TRACKS
+            audio_canvases = self._canvases[: self._n_audio_tracks]
+            for canvas, (label, col_slice, hex_color, do_fill) in zip(
+                audio_canvases, _FEATURE_TRACKS
             ):
-                group = features[:, col_slice]
-                signal = np.mean(np.abs(group), axis=1) if group.shape[1] > 1 else group[:, 0]
-
+                signal = audio_features[:, col_slice][:, 0]
                 peak = float(signal.max()) if signal.max() > 0 else 1.0
                 normalised = (signal / peak).tolist()
+                canvas.set_data([(label, normalised, hex_color, do_fill)], self._duration_ms)
 
-                # _FeatureCanvas.set_data expects list of track tuples
-                canvas.set_data(
-                    [(_label, normalised, hex_color, do_fill)],
-                    self._duration_ms,
-                )
-
-            # status line
-            T = features.shape[0]
-            rms_raw = features[:, 39]
-            n_minima = sum(
-                1 for i in range(1, T - 1)
-                if rms_raw[i] < rms_raw[i - 1]
-                and rms_raw[i] < rms_raw[i + 1]
-                and rms_raw[i] < 0.30 * float(rms_raw.max())
+            # ── Video-Features (T_v, 3) ─────────────────────────────
+            video_features: np.ndarray = VideoFeatureExtractor.extract_video_features(
+                self._session
             )
-            hop_ms = (self._duration_ms / T) if T > 0 else 0
+            T_v = video_features.shape[0]
+
+            video_canvases = self._canvases[
+                self._n_audio_tracks : self._n_audio_tracks + self._n_video_tracks
+            ]
+            for canvas, (label, col_idx, hex_color, do_fill) in zip(
+                video_canvases, _VIDEO_FEATURE_TRACKS
+            ):
+                signal_raw = video_features[:, col_idx]  # (T_v,)
+
+                # Interpoliere auf die Audio-Auflösung (T_a Frames), damit
+                # Cursor und Zeitachse für alle Lanes identisch sind.
+                if T_v >= 2 and T_a >= 2:
+                    x_old = np.linspace(0.0, 1.0, T_v)
+                    x_new = np.linspace(0.0, 1.0, T_a)
+                    signal_resampled = np.interp(x_new, x_old, signal_raw)
+                else:
+                    signal_resampled = signal_raw
+
+                peak = float(signal_resampled.max()) if signal_resampled.max() > 0 else 1.0
+                normalised = (signal_resampled / peak).tolist()
+                canvas.set_data([(label, normalised, hex_color, do_fill)], self._duration_ms)
+
+            # ── Status bar ─────────────────────────────────────────────
+            rms_col = audio_features[:, 0]
+            n_minima = sum(
+                1 for i in range(1, T_a - 1)
+                if rms_col[i] < rms_col[i - 1]
+                and rms_col[i] < rms_col[i + 1]
+                and rms_col[i] < 0.30 * float(rms_col.max())
+            )
+            hop_ms = (self._duration_ms / T_a) if T_a > 0 else 0
             self._status.setText(
-                f"  {T} Frames  ·  ~{hop_ms:.0f} ms/Frame  ·  "
-                f"Ø RMS {float(np.mean(rms_raw)):.4f}  ·  {n_minima} RMS-Minima (< 30 % Peak)"
+                f"  Audio: {T_a} Frames  ·  ~{hop_ms:.0f} ms/Frame  ·  "
+                f"Ø RMS {float(np.mean(rms_col)):.4f}  ·  "
+                f"{n_minima} RMS-Minima (< 30 % Peak)  ·  "
+                f"Video: {T_v} Frames  ·  ECR / ARR / pHash / SSIM / ROI"
             )
         except Exception as exc:
             self._status.setText(f"Fehler beim Berechnen: {exc}")
@@ -874,17 +1000,17 @@ class AnnotationWindow(QWidget):
         layout.addWidget(dir_container)
         layout.addStretch()
 
-        self._rms_button = QPushButton("♪  RMS-Verlauf")
-        self._rms_button.setCursor(Qt.CursorShape.PointingHandCursor)
-        self._rms_button.setToolTip("Energieverlauf der Stimme auf Zeitleiste anzeigen")
-        self._rms_button.setStyleSheet(
+        self._features_button = QPushButton("♪  Features")
+        self._features_button.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._features_button.setToolTip("Energieverlauf der Stimme auf Zeitleiste anzeigen")
+        self._features_button.setStyleSheet(
             "QPushButton{background:#e8f0fe;color:#1a6fc4;border:1px solid #c5d8f6;"
             "border-radius:5px;font-size:12px;font-weight:600;padding:0 12px;}"
             "QPushButton:hover{background:#d0e4ff;border-color:#4da3ff;}"
             "QPushButton:pressed{background:#bdd4f8;}"
         )
-        self._rms_button.clicked.connect(self._show_rms_visualizer)
-        layout.addWidget(self._rms_button)
+        self._features_button.clicked.connect(self._show_rms_visualizer)
+        layout.addWidget(self._features_button)
         layout.addSpacing(6)
 
         layout.addWidget(self._boundary_count_label)
@@ -1257,11 +1383,19 @@ class AnnotationWindow(QWidget):
             self._rms_dialog.close()
             self._rms_dialog = None
 
+        # Lazy-Import wie bei den anderen Feature-Extraktoren: vermeidet,
+        # dass schwere Abhängigkeiten (librosa/numpy/scipy) schon beim
+        # App-Start geladen werden, statt erst beim Öffnen des Dialogs.
+        from docupilot.segmentation.feature_extraction import EventFeatureExtractor
+
+        event_markers = EventFeatureExtractor.extract_event_markers(self._session)
+
         self._rms_dialog = _RmsVisualizerDialog(
             player=self._player,
             session=self._session,
             duration_ms=self._duration_ms,
             boundaries=self._boundaries,
+            event_markers=event_markers,
             parent=self,
         )
         self._rms_dialog.show()

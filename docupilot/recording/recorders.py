@@ -47,6 +47,11 @@ class AvRecorder:
         geo = session.screen.geometry()
         self._w = geo.width()
         self._h = geo.height()
+        # Letzte bekannte Cursor-Position (Bildschirmkoordinaten).
+        # Wird von InputRecorder.update_cursor_pos() thread-safe aktualisiert.
+        self._cursor_x: int = 0
+        self._cursor_y: int = 0
+        self._cursor_lock = threading.Lock()
 
     def start(self) -> None:
         """
@@ -125,9 +130,14 @@ class AvRecorder:
                 bgra = np.frombuffer(screenshot.raw, dtype=np.uint8).reshape(
                     screenshot.height, screenshot.width, 4
                 )
+
+                # Cursor als weisses Dreieck einzeichnen (BGR, ohne Alpha).
+                bgr = bgra[:, :, :3].copy()
+                self._draw_cursor(bgr, geo.x(), geo.y())
+
                 try:
                     if self._proc and self._proc.stdin:
-                        self._proc.stdin.write(bgra[:, :, :3].tobytes())
+                        self._proc.stdin.write(bgr.tobytes())
                         self._proc.stdin.flush()
                 except (BrokenPipeError, OSError):
                     break
@@ -135,6 +145,44 @@ class AvRecorder:
                 elapsed = time.monotonic() - t0
                 if elapsed < interval:
                     time.sleep(interval - elapsed)
+
+    def update_cursor_pos(self, x: int, y: int) -> None:
+        """Aktualisiert die Cursor-Position thread-sicher (gerufen von InputRecorder)."""
+        with self._cursor_lock:
+            self._cursor_x = x
+            self._cursor_y = y
+
+    def _draw_cursor(self, bgr: np.ndarray, screen_x: int, screen_y: int) -> None:
+        """
+        Zeichnet einen stilisierten Mauszeiger (weisses Dreieck mit schwarzem
+        Rand) in das BGR-Frame ein.
+
+        Koordinaten: screen_x/screen_y ist der Ursprung des aufgenommenen
+        Bildschirmbereichs. Die gespeicherte Cursor-Position ist in absoluten
+        Bildschirmkoordinaten -- wir subtrahieren den Bereichs-Offset um Frame-
+        relative Pixelkoordinaten zu erhalten.
+        """
+        import cv2
+        with self._cursor_lock:
+            cx = self._cursor_x - screen_x
+            cy = self._cursor_y - screen_y
+
+        h, w = bgr.shape[:2]
+        if not (0 <= cx < w and 0 <= cy < h):
+            return  # Cursor ausserhalb des aufgenommenen Bereichs
+
+        # Pfeilspitze oben links, 3 Punkte des Dreiecks (skaliert mit Frame-Hoehe).
+        size = max(8, int(h * 0.018))  # ~15 px bei 864 px Hoehe
+        pts = np.array([
+            [cx,          cy         ],
+            [cx,          cy + size  ],
+            [cx + size//2, cy + int(size * 0.65)],
+        ], dtype=np.int32)
+
+        # Schwarzer Rand (1 px breiter)
+        cv2.fillPoly(bgr, [pts + 1], (0, 0, 0))
+        # Weisser Pfeil
+        cv2.fillPoly(bgr, [pts], (255, 255, 255))
 
     @staticmethod
     def _finalize(proc: subprocess.Popen, on_done=None) -> None:
@@ -224,9 +272,11 @@ class InputRecorder:
 
     _THROTTLE_MS = 50.0
 
-    def __init__(self, session: RecordingSession, writer: EventWriter) -> None:
+    def __init__(self, session: RecordingSession, writer: EventWriter,
+                 av_recorder: "AvRecorder | None" = None) -> None:
         self._session = session
         self._writer = writer
+        self._av_recorder = av_recorder  # fuer Cursor-Position-Updates
         self._last_move_t_ms = 0.0
         self._mouse: pynput.mouse.Listener | None = None
         self._keyboard: pynput.keyboard.Listener | None = None
@@ -235,6 +285,7 @@ class InputRecorder:
         self._last_move_t_ms = 0.0
         self._writer.write({"type": "input_started"}, t_ms=self._session.session_time_ms())
         self._mouse = pynput.mouse.Listener(
+            on_move=self._on_move,
             on_click=self._on_click,
             on_scroll=self._on_scroll,
         )
@@ -255,6 +306,10 @@ class InputRecorder:
             self._keyboard.stop()
             self._keyboard = None
         self._writer.write({"type": "input_stopped"}, t_ms=self._session.session_time_ms())
+
+    def _on_move(self, x: int, y: int) -> None:
+        if self._av_recorder is not None:
+            self._av_recorder.update_cursor_pos(x, y)
 
     def _on_click(self, x: int, y: int, button, pressed: bool) -> None:
         self._writer.write(
@@ -330,7 +385,7 @@ class RecorderService(QObject):
                 self._writer.open()
                 self._av = AvRecorder(session, self._writer)
                 self._av._on_done_callback = lambda: self.recording_finalized.emit(session)
-                self._input = InputRecorder(session, self._writer)
+                self._input = InputRecorder(session, self._writer, self._av)
 
             if self._av and self._input:
                 self._av.start()
