@@ -5,18 +5,16 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from PySide6.QtCore import QTimer, QUrl, Qt, Signal
-from PySide6.QtGui import QColor, QPainter, QPen, QFont, QBrush
+from PySide6.QtGui import QColor, QPainter
 from PySide6.QtMultimedia import QAudioOutput, QMediaPlayer
 from PySide6.QtMultimediaWidgets import QVideoWidget
 from PySide6.QtWidgets import (
     QDialog,
-    QFrame,
     QHBoxLayout,
     QLabel,
     QListWidget,
     QListWidgetItem,
     QPushButton,
-    QScrollArea,
     QSizePolicy,
     QSlider,
     QSplitter,
@@ -28,109 +26,44 @@ from PySide6.QtWidgets import (
 
 from docupilot.recording.session import RecordingSession
 
-try:
-    import librosa
-    import numpy as np
-    _LIBROSA_AVAILABLE = True
-except ImportError:
-    _LIBROSA_AVAILABLE = False
-
-_MARKER_TYPES = {"mouse_click", "key_press", "key_release", "mouse_scroll"}
-
-_DOT_COLOR = {
-    "av_started": "#534AB7",
-    "av_stopped": "#534AB7",
-    "input_started": "#1D9E75",
-    "input_stopped": "#1D9E75",
-    "recording_started": "#e24b4a",
-    "recording_stopping": "#e24b4a",
-    "recording_stopped": "#e24b4a",
-    "mouse_click": "#D85A30",
-    "mouse_scroll": "#D85A30",
-    "mouse_move": "#aaaaaa",
-    "key_press": "#BA7517",
-    "key_release": "#BA7517",
-}
-
-_DEFAULT_COLOR_DOT = "#aaaaaa"
-
-_PROMINENT_TYPES = {
-    "av_started",
-    "av_stopped",
-    "input_started",
-    "input_stopped",
-    "recording_started",
-    "recording_stopping",
-    "recording_stopped",
-    "mouse_click",
-    "key_press",
-    "key_release",
-    "mouse_scroll",
-}
-
-
-def _fmt_ms(ms: float) -> str:
-    """
-    Displays time in the format HH:MM:SS.mmm.
-    :param ms: Milliseconds as float.
-    :return: A string in the format HH:MM:SS.mmm.
-    """
-
-    total_s = int(ms) // 1000
-    return f"{total_s // 60:02d}:{total_s % 60:02d}.{int(ms) % 1000:03d}"
-
-
-def _event_label(ev: dict) -> str:
-    """
-    Creates a label for an event.
-    :param ev: The event to create a label for.
-    :return: The label as string.
-    """
-
-    t = ev.get("type", "?")
-    parts = [t]
-    if t == "mouse_click":
-        action = "↓" if ev.get("pressed") else "↑"
-        parts.append(
-            f"{ev.get('button', '').replace('Button.', '')}{action} ({ev.get('x', '?')},{ev.get('y', '?')})"
-        )
-    elif t in ("mouse_move", "mouse_scroll"):
-        parts.append(f"({ev.get('x', '?')}, {ev.get('y', '?')})")
-    elif t in ("key_press", "key_release"):
-        parts.append(str(ev.get("key", "")))
-    return "  ".join(parts)
+from docupilot.ui.event_formatting import MARKER_TYPES, format_ms
+from docupilot.ui.widgets.EventsPanelWidget import EventsPanelWidget
+from docupilot.ui.widgets.FeatureDialog import FeatureDialog
 
 
 class _MarkerSlider(QSlider):
     """
-    Custom slider widget that supports visual markers.
+    Slider widget that paints small dots over its groove for marker
+    positions (used to highlight notable events along the timeline).
     """
 
     def __init__(self, parent: QWidget | None = None) -> None:
         """
-        Initializes the slider widget.
-        :param parent: The parent widget.
-        """
+        Initialize the slider widget.
 
+        :param parent: The parent widget.
+        :return: None
+        """
         super().__init__(Qt.Orientation.Horizontal, parent)
         self._markers: list[float] = []
 
     def set_markers(self, fractions: list[float]) -> None:
         """
-        Set the markers for the slider.
-        :param fractions: The list of marker fractions.
-        """
+        Set marker positions as fractions of the slider range.
 
+        :param fractions: Marker positions in the range [0.0, 1.0].
+        :return: None
+        """
         self._markers = [f for f in fractions if 0.0 <= f <= 1.0]
         self.update()
 
     def paintEvent(self, paint_event) -> None:
         """
-        Paint the event markers on the slider.
+        Paint the slider, then overlay marker dots.
+
         :param paint_event: The paint event.
         :return: None
         """
-
         super().paintEvent(paint_event)
 
         if not self._markers:
@@ -157,124 +90,19 @@ class _MarkerSlider(QSlider):
         painter.end()
 
 
-class _EventRow(QWidget):
-    """
-    Class representing a row in an event view widget.
-    """
-
-    jumped = Signal(float)
-
-    def __init__(self, ev: dict, parent: QWidget | None = None) -> None:
-        """
-        Initializes the event row widget.
-        :param ev: The event data.
-        :param parent: The parent widget.
-        """
-
-        super().__init__(parent)
-
-        self.event_data = ev
-        self._active = False
-        self._prominent = ev.get("type") in _PROMINENT_TYPES
-
-        self.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.setToolTip(f"Springe zu {_fmt_ms(ev.get('t_ms', 0.0))}")
-
-        layout = QHBoxLayout(self)
-        layout.setContentsMargins(8, 3, 8, 3)
-        layout.setSpacing(6)
-
-        color = _DOT_COLOR.get(ev.get("type", ""), _DEFAULT_COLOR_DOT)
-        dot = QLabel()
-        dot.setFixedSize(8, 8)
-        dot.setStyleSheet(f"background:{color}; border-radius:4px;")
-        layout.addWidget(dot)
-
-        type_label = QLabel(ev.get("type", "?"))
-        if self._prominent:
-            type_label.setStyleSheet("font-size:12px; font-weight:600; color:#222;")
-        else:
-            type_label.setStyleSheet("font-size:11px; color:#666;")
-        layout.addWidget(type_label)
-
-        if self._prominent:
-            t = ev.get("type", "")
-            detail = ""
-            if t == "mouse_click":
-                action = "↓" if ev.get("pressed") else "↑"
-                detail = f"{ev.get('button', '').replace('Button.', '')}{action}"
-            elif t in ("key_press", "key_release"):
-                detail = str(ev.get("key", ""))
-            elif t in ("mouse_scroll",):
-                detail = f"({ev.get('x', '?')},{ev.get('y', '?')})"
-            if detail:
-                detail_label = QLabel(detail)
-                detail_label.setStyleSheet("font-size:11px; color:#888;")
-                layout.addWidget(detail_label)
-
-        layout.addStretch()
-
-        time_label = QLabel(_fmt_ms(ev.get("t_ms", 0.0)))
-        time_label.setStyleSheet("font-size:10px; color:#bbb; font-family:monospace;")
-        layout.addWidget(time_label)
-
-        self._update_style(active=False)
-
-    def mousePressEvent(self, mouse_event) -> None:
-        """
-        Handles the mouse press event.
-        :param mouse_event: The mouse press event.
-        :return: None
-        """
-
-        self.jumped.emit(float(self.event_data.get("t_ms", 0.0)))
-
-    def set_active(self, active: bool, past: bool) -> None:
-        """
-        Set the active state of the event row.
-        :param active: Whether the event row is active.
-        :param past: Whether the event row is in the past.
-        :return: None
-        """
-
-        if self._active == active:
-            return
-
-        self._active = active
-        self._update_style(active=active, past=past)
-
-    def _update_style(self, *, active: bool, past: bool = False) -> None:
-        """
-        Update the style of the event row.
-        :param active: Whether the event row is active.
-        :param past: Whether the event row is in the past.
-        :return: None
-        """
-
-        if active:
-            self.setStyleSheet(
-                "background:#dbeafe; border-radius:5px;border-left:3px solid #4da3ff;"
-            )
-        elif past and not self._prominent:
-            self.setStyleSheet("background:transparent; border:none; opacity:0.5;")
-        else:
-            self.setStyleSheet("background:transparent; border:none;")
-
-        self.setProperty("active", active)
-
-
 class _BoundaryDialog(QDialog):
     """
-    The dialog for managing boundaries.
+    Dialog for viewing and deleting ground-truth boundaries.
     """
 
     def __init__(self, boundaries: list[dict], parent: QWidget | None = None) -> None:
         """
         Initialize the dialog.
+
         :param boundaries: The list of boundaries.
         :param parent: The parent widget.
+        :return: None
         """
-
         super().__init__(parent)
 
         self.setWindowTitle("Gesetzte Grenzen")
@@ -326,22 +154,23 @@ class _BoundaryDialog(QDialog):
 
     def _refresh_list(self) -> None:
         """
-        Refresh the list of boundaries.
+        Rebuild the list widget from self._boundaries.
+
         :return: None
         """
-
         self._list.clear()
 
         for i, b in enumerate(self._boundaries):
             t_ms = b.get("t_ms", 0.0)
             created = b.get("created_at_utc", "")[:19].replace("T", "  ")
-            item = QListWidgetItem(f"#{i + 1}   {_fmt_ms(t_ms)}   —   {created} UTC")
+            item = QListWidgetItem(f"#{i + 1}   {format_ms(t_ms)}   —   {created} UTC")
             item.setData(Qt.ItemDataRole.UserRole, i)
             self._list.addItem(item)
 
     def _delete_selected(self) -> None:
         """
-        Delete the selected boundaries.
+        Remove the selected boundaries and refresh the list.
+
         :return: None
         """
         selected = self._list.selectedItems()
@@ -361,518 +190,37 @@ class _BoundaryDialog(QDialog):
 
     def get_boundaries(self) -> list[dict]:
         """
-        Get the list of boundaries.
+        Get the current list of boundaries.
+
         :return: The list of boundaries.
         """
-
         return self._boundaries
-
-
-# Einheitliche Farben pro Modalität, statt einer Einzelfarbe je Feature --
-# macht auf den ersten Blick klar, was Audio, was Video und was ein Event ist.
-_AUDIO_COLOR = "#ef4444"  # rot     – alle Audio-Feature-Kurven
-_VIDEO_COLOR = "#22c55e"  # grün    – alle Video-Feature-Kurven
-_EVENT_COLOR = "#38bdf8"  # hellblau – Event-Marker (Klick/Taste/Scroll)
-
-# Feature-Gruppen aus dem 5-dim Vektor: (Label, Spaltenbereich, Farbe, Fill)
-_FEATURE_TRACKS: list[tuple[str, slice, str, bool]] = [
-    ("RMS  (roh)", slice(0, 1), _AUDIO_COLOR, True),
-    ("Pausendauer", slice(1, 2), _AUDIO_COLOR, True),
-    ("Pitch-Reset", slice(2, 3), _AUDIO_COLOR, True),
-    ("Energie-Sprung", slice(3, 4), _AUDIO_COLOR, True),
-    ("Sprechtempo", slice(4, 5), _AUDIO_COLOR, True),
-]
-
-# Feature-Gruppen aus dem 5-dim Video-Vektor: (Label, Spaltenindex, Farbe, Fill)
-_VIDEO_FEATURE_TRACKS: list[tuple[str, int, str, bool]] = [
-    ("ECR  (Kanten-änderung)",    0, _VIDEO_COLOR, True),
-    ("ARR  (Flächen-änderung)",   1, _VIDEO_COLOR, True),
-    ("pHash (Struktur-änderung)", 2, _VIDEO_COLOR, True),
-    ("SSIM  (Wahrnehmung)",       3, _VIDEO_COLOR, True),
-    ("ROI   (Titelleiste)",       4, _VIDEO_COLOR, True),
-]
-
-
-class _FeatureCanvas(QWidget):
-    """
-    Paints a normalised feature curve on a shared timeline.
-    Used here for one column of the 5-dim Audio-Feature-Vektor at a time
-    (siehe _FEATURE_TRACKS für die Zuordnung Spalte → Lane).
-    Clicking seeks the video player.
-    """
-
-    seek_requested = Signal(float)
-
-    _PAD_L = 52
-    _PAD_R = 16
-    _PAD_T = 16
-    _PAD_B = 32
-
-    def __init__(self, parent: QWidget | None = None) -> None:
-        super().__init__(parent)
-        # Each entry: (label, normalised values [0..1], hex color, fill flag)
-        self._tracks: list[tuple[str, list[float], str, bool]] = []
-        self._duration_ms: float = 0.0
-        self._cursor_ms: float = 0.0
-        self._boundaries: list[float] = []
-        # Each entry: (t_ms, event_type) – rendered as small colored dots near the top
-        self._events: list[tuple[float, str]] = []
-        self.setMinimumHeight(160)
-        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
-        self.setCursor(Qt.CursorShape.CrossCursor)
-
-    # ------------------------------------------------------------------ data
-    def set_data(self, tracks: list[tuple[str, list[float], str, bool]], duration_ms: float) -> None:
-        """
-        Load feature tracks.
-        :param tracks: list of (label, normalised_values, hex_color, fill)
-        :param duration_ms: total recording duration in milliseconds
-        """
-        self._tracks = tracks
-        self._duration_ms = duration_ms
-        self.update()
-
-    def set_cursor(self, pos_ms: float) -> None:
-        """Move the playback cursor line."""
-        self._cursor_ms = pos_ms
-        self.update()
-
-    def set_boundaries(self, boundaries_ms: list[float]) -> None:
-        """Show ground-truth boundary lines."""
-        self._boundaries = boundaries_ms
-        self.update()
-
-    def set_events(self, events: list[tuple[float, str]]) -> None:
-        """
-        Show event markers (clicks, key presses, scrolls) as small dots
-        near the top of the lane, colored per event type.
-        :param events: list of (t_ms, event_type)
-        """
-        self._events = events
-        self.update()
-
-    # --------------------------------------------------------------- interaction
-    def mousePressEvent(self, event) -> None:
-        if self._duration_ms <= 0:
-            return
-        x = event.position().x()
-        frac = (x - self._PAD_L) / max(1, self.width() - self._PAD_L - self._PAD_R)
-        frac = max(0.0, min(1.0, frac))
-        self.seek_requested.emit(frac * self._duration_ms)
-
-    # --------------------------------------------------------------- painting
-    def paintEvent(self, _event) -> None:  # noqa: N802
-        if not self._tracks and not self._events:
-            self._paint_empty()
-            return
-
-        from PySide6.QtGui import QPolygon
-        from PySide6.QtCore import QPoint
-
-        w = self.width()
-        h = self.height()
-        pl, pr, pt, pb = self._PAD_L, self._PAD_R, self._PAD_T, self._PAD_B
-        plot_w = w - pl - pr
-        plot_h = h - pt - pb
-
-        p = QPainter(self)
-        p.setRenderHint(QPainter.RenderHint.Antialiasing)
-
-        # --- background
-        p.fillRect(0, 0, w, h, QColor("#1e1e2e"))
-        p.fillRect(pl, pt, plot_w, plot_h, QColor("#12121a"))
-
-        label_font = QFont("monospace", 8)
-        p.setFont(label_font)
-        label_color = QColor("#666688")
-        grid_pen = QPen(QColor("#2a2a40"))
-        grid_pen.setWidth(1)
-
-        # --- horizontal grid + y-axis labels
-        for frac in (0.0, 0.25, 0.5, 0.75, 1.0):
-            y = pt + plot_h - int(frac * plot_h)
-            p.setPen(grid_pen)
-            p.drawLine(pl, y, pl + plot_w, y)
-            p.setPen(label_color)
-            p.drawText(2, y + 4, pl - 6, 12, Qt.AlignmentFlag.AlignRight, f"{frac:.2f}")
-
-        # --- time axis labels + vertical grid
-        n_ticks = 6
-        for i in range(n_ticks + 1):
-            frac = i / n_ticks
-            x = pl + int(frac * plot_w)
-            t_s = frac * self._duration_ms / 1000
-            p.setPen(label_color)
-            label = f"{int(t_s // 60):02d}:{t_s % 60:04.1f}"
-            p.drawText(x - 24, h - pb + 4, 48, pb - 4, Qt.AlignmentFlag.AlignHCenter, label)
-            tick_pen = QPen(QColor("#333355"))
-            tick_pen.setWidth(1)
-            p.setPen(tick_pen)
-            p.drawLine(x, pt, x, pt + plot_h)
-
-        # --- boundary lines
-        if self._duration_ms > 0:
-            for b_ms in self._boundaries:
-                bx = pl + int(b_ms / self._duration_ms * plot_w)
-                boundary_pen = QPen(QColor("#D85A30"))
-                boundary_pen.setWidth(1)
-                boundary_pen.setStyle(Qt.PenStyle.DashLine)
-                p.setPen(boundary_pen)
-                p.drawLine(bx, pt, bx, pt + plot_h)
-
-        # --- feature curves
-        for label, values, hex_color, do_fill in self._tracks:
-            n = len(values)
-            if n < 2:
-                continue
-            xs = [pl + int(i / (n - 1) * plot_w) for i in range(n)]
-            ys = [pt + plot_h - int(v * plot_h) for v in values]
-
-            # optional filled area
-            if do_fill:
-                fill_color = QColor(hex_color)
-                fill_color.setAlpha(35)
-                poly_points = [QPoint(xs[0], pt + plot_h)]
-                for x, y in zip(xs, ys):
-                    poly_points.append(QPoint(x, y))
-                poly_points.append(QPoint(xs[-1], pt + plot_h))
-                p.setBrush(QBrush(fill_color))
-                p.setPen(Qt.PenStyle.NoPen)
-                p.drawPolygon(QPolygon(poly_points))
-
-            # curve line
-            curve_pen = QPen(QColor(hex_color))
-            curve_pen.setWidth(2)
-            p.setPen(curve_pen)
-            p.setBrush(Qt.BrushStyle.NoBrush)
-            for i in range(n - 1):
-                p.drawLine(xs[i], ys[i], xs[i + 1], ys[i + 1])
-
-            # RMS-only: mark significant local minima
-            if label == "RMS":
-                min_pen = QPen(QColor(hex_color))
-                min_pen.setWidth(1)
-                p.setPen(min_pen)
-                p.setBrush(QBrush(QColor(hex_color)))
-                for i in range(1, n - 1):
-                    if values[i] < values[i - 1] and values[i] < values[i + 1] and values[i] < 0.30:
-                        p.drawEllipse(xs[i] - 3, ys[i] - 3, 6, 6)
-
-        # --- playback cursor
-        if self._duration_ms > 0:
-            cx = pl + int(self._cursor_ms / self._duration_ms * plot_w)
-            cursor_pen = QPen(QColor("#ffffff"))
-            cursor_pen.setWidth(2)
-            p.setPen(cursor_pen)
-            p.drawLine(cx, pt, cx, pt + plot_h)
-
-        # --- event markers: hellblaue Punkte. Auf einer reinen Event-Spur
-        # (keine Kurven, z.B. die dedizierte Event-Zeitleiste) mittig und
-        # größer; auf einer Kurven-Spur klein am oberen Rand, falls doch mal
-        # set_events() zusätzlich zu Kurvendaten gesetzt wird.
-        if self._duration_ms > 0 and self._events:
-            is_event_only_lane = not self._tracks
-            marker_y = pt + plot_h / 2 if is_event_only_lane else pt + 6
-            radius = 4 if is_event_only_lane else 3
-            p.setPen(Qt.PenStyle.NoPen)
-            p.setBrush(QBrush(QColor(_EVENT_COLOR)))
-            for ev_ms, _ev_type in self._events:
-                ex = pl + int(ev_ms / self._duration_ms * plot_w)
-                p.drawEllipse(int(ex - radius), int(marker_y - radius), radius * 2, radius * 2)
-
-        p.end()
-
-    def _paint_empty(self) -> None:
-        p = QPainter(self)
-        p.fillRect(0, 0, self.width(), self.height(), QColor("#1e1e2e"))
-        p.setPen(QColor("#555"))
-        p.setFont(QFont("sans-serif", 11))
-        p.drawText(self.rect(), Qt.AlignmentFlag.AlignCenter, "Keine Audio-Daten verfügbar")
-        p.end()
-
-
-class _RmsVisualizerDialog(QDialog):
-    """
-    Non-modal dialog with one dedicated timeline per Audio-Feature.
-
-    Tracks from extract_audio_features() (5-dim vector):
-      • RMS roh        (col 0) – rohe Lautstärke/Energie pro Zeitfenster
-      • Pausendauer    (col 1) – Dauer der aktuellen Sprechpause in Sekunden
-      • Pitch-Reset    (col 2) – |Δ Median-F0| vor/nach einer Pause
-      • Energie-Sprung (col 3) – |Δ mittlere RMS-Energie| vor/nach einer Pause
-      • Sprechtempo    (col 4) – lokale Silbenrate über Envelope-Peaks
-
-    The timeline shares the playback-cursor needle and boundary lines.
-    Event-Marker (Klick/Taste/Scroll) kommen bereits fertig extrahiert von
-    EventFeatureExtractor.extract_event_markers() herein.
-    Clicking the timeline seeks the video player.
-    """
-
-    def __init__(
-        self,
-        player: QMediaPlayer,
-        session: RecordingSession,
-        duration_ms: float,
-        boundaries: list[dict],
-        event_markers: list[tuple[float, str]] | None = None,
-        parent: QWidget | None = None,
-    ) -> None:
-        super().__init__(parent)
-        self.setWindowTitle("Feature-Verläufe · Audio & Video · Visualisierung")
-        self.setMinimumSize(820, 700)
-        self.resize(1100, 950)
-        self.setModal(False)
-
-        self._player = player
-        self._session = session
-        self._duration_ms = duration_ms
-        self._boundaries_ms = [b.get("t_ms", 0.0) for b in boundaries]
-
-        # Bereits durch EventFeatureExtractor.extract_event_markers() auf
-        # die markanten Typen gefiltert und sortiert (siehe AnnotationWindow).
-        self._event_markers: list[tuple[float, str]] = event_markers or []
-
-        # canvases for the audio-feature tracks (currently 5-dim) + future
-        # video-/event-feature tracks, in display order
-        self._canvases: list[_FeatureCanvas] = []
-
-        root = QVBoxLayout(self)
-        root.setContentsMargins(14, 14, 14, 10)
-        root.setSpacing(8)
-
-        # --- header
-        header = QLabel(
-            "Audio-Features (rot) + Video-Features (grün)  ·  gestrichelt = gesetzte Grenzen  ·  "
-            "eigene Zeitleiste unten = Events (hellblau)  ·  Klick auf Timeline → Sprung im Video"
-        )
-        header.setStyleSheet("color:#aaa; font-size:11px;")
-        root.addWidget(header)
-
-        # --- scrollable lanes
-        scroll = QScrollArea()
-        scroll.setWidgetResizable(True)
-        scroll.setFrameShape(QFrame.Shape.NoFrame)
-        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
-        scroll.setStyleSheet("background:#1e1e2e;")
-
-        lanes_widget = QWidget()
-        lanes_widget.setStyleSheet("background:#1e1e2e;")
-        lanes_layout = QVBoxLayout(lanes_widget)
-        lanes_layout.setContentsMargins(0, 0, 0, 0)
-        lanes_layout.setSpacing(2)
-
-        def _add_lane(label: str, hex_color: str, do_fill: bool, *, height: int = 140) -> _FeatureCanvas:
-            lbl = QLabel(f"  {label}")
-            lbl.setFixedHeight(22)
-            lbl.setStyleSheet(
-                f"color:{hex_color}; font-size:11px; font-weight:600; "
-                f"background:#1e1e2e; border-left:3px solid {hex_color}; padding-left:6px;"
-            )
-            lanes_layout.addWidget(lbl)
-            c = _FeatureCanvas()
-            c.setFixedHeight(height)
-            c.set_boundaries(self._boundaries_ms)
-            c.seek_requested.connect(self._on_seek)
-            lanes_layout.addWidget(c)
-            self._canvases.append(c)
-            return c
-
-        # Audio-Feature-Tracks (aus dem 5-dim Vektor)
-        self._n_audio_tracks = len(_FEATURE_TRACKS)
-        for _label, _col_slice, hex_color, do_fill in _FEATURE_TRACKS:
-            _add_lane(_label, hex_color, do_fill)
-
-        # —— Trennlinie zwischen Audio- und Video-Sektion ——
-        separator = QFrame()
-        separator.setFrameShape(QFrame.Shape.HLine)
-        separator.setStyleSheet("color:#333355; margin:6px 0;")
-        lanes_layout.addWidget(separator)
-        vid_header = QLabel("  ►  Video-Features (ECR / ARR / pHash / SSIM / ROI)")
-        vid_header.setFixedHeight(24)
-        vid_header.setStyleSheet(
-            "color:#aaa; font-size:11px; font-style:italic; background:#1e1e2e; padding-left:6px;"
-        )
-        lanes_layout.addWidget(vid_header)
-
-        # Video-Feature-Tracks (aus dem 3-dim Vektor)
-        self._n_video_tracks = len(_VIDEO_FEATURE_TRACKS)
-        for _label, _col_idx, hex_color, do_fill in _VIDEO_FEATURE_TRACKS:
-            _add_lane(_label, hex_color, do_fill)
-
-        # —— Trennlinie + eigene Event-Zeitleiste ——
-        # Bewusst getrennt von den Feature-Kurven: vorher saßen die
-        # Event-Punkte mit auf jeder einzelnen Spur, das wurde schnell
-        # unübersichtlich. Jetzt gibt es eine eigene Zeile, genauso
-        # aufgebaut wie die Audio-/Video-Spuren (gleiche Höhe, gleicher
-        # set_data()-Mechanismus für die Dauer) – nur ohne Kurve, dafür
-        # mit den Event-Punkten.
-        separator_events = QFrame()
-        separator_events.setFrameShape(QFrame.Shape.HLine)
-        separator_events.setStyleSheet("color:#333355; margin:6px 0;")
-        lanes_layout.addWidget(separator_events)
-        event_header = QLabel("  ►  Events (Klick / Taste / Scroll)")
-        event_header.setFixedHeight(24)
-        event_header.setStyleSheet(
-            "color:#aaa; font-size:11px; font-style:italic; background:#1e1e2e; padding-left:6px;"
-        )
-        lanes_layout.addWidget(event_header)
-
-        self._event_canvas = _add_lane("Events", _EVENT_COLOR, False)
-        # set_data() wie bei den anderen Spuren – ohne diesen Aufruf bleibt
-        # _duration_ms auf 0 und die Zeitleiste (inkl. der Punkte) wird
-        # nie gezeichnet, da paintEvent() darauf prüft.
-        self._event_canvas.set_data([], self._duration_ms)
-        self._event_canvas.set_events(self._event_markers)
-
-        lanes_layout.addStretch()
-        scroll.setWidget(lanes_widget)
-        root.addWidget(scroll, stretch=1)
-
-        # --- status bar
-        self._status = QLabel("Wird berechnet …")
-        self._status.setStyleSheet("color:#666; font-size:10px;")
-        root.addWidget(self._status)
-
-        # --- close button
-        btn_row = QHBoxLayout()
-        btn_row.addStretch()
-        close_btn = QPushButton("Schließen")
-        close_btn.setStyleSheet(
-            "QPushButton{background:#fff;color:#333;border:1px solid #ccc;"
-            "border-radius:6px;padding:5px 14px;font-size:12px;}"
-            "QPushButton:hover{background:#f0f0f0;}"
-        )
-        close_btn.clicked.connect(self.accept)
-        btn_row.addWidget(close_btn)
-        root.addLayout(btn_row)
-
-        # live cursor – broadcasts to all canvases
-        self._timer = QTimer(self)
-        self._timer.setInterval(80)
-        self._timer.timeout.connect(self._sync_cursor)
-        self._timer.start()
-
-        QTimer.singleShot(50, self._compute_features)
-
-    # ------------------------------------------------------------------ feature computation
-    def _compute_features(self) -> None:
-        """
-        Populate all canvas lanes.
-
-        Audio-Tracks (5-dim Vektor): RMS, Pausendauer, Pitch-Reset,
-        Energie-Sprung, Sprechtempo.
-
-        Video-Tracks (5-dim Vektor): ECR, ARR, pHash, SSIM, ROI.
-        Video-Features werden auf die Audio-Zeitachse (T_audio Frames)
-        interpoliert, damit beide Sections dieselbe Zeitbasis teilen.
-        """
-        try:
-            from docupilot.segmentation.feature_extraction import (
-                AudioFeatureExtractor,
-                VideoFeatureExtractor,
-            )
-            import numpy as np
-
-            # ── Audio-Features (T_a, 5) ─────────────────────────────
-            audio_features: np.ndarray = AudioFeatureExtractor.extract_audio_features(
-                self._session
-            )
-            T_a = audio_features.shape[0]
-
-            audio_canvases = self._canvases[: self._n_audio_tracks]
-            for canvas, (label, col_slice, hex_color, do_fill) in zip(
-                audio_canvases, _FEATURE_TRACKS
-            ):
-                signal = audio_features[:, col_slice][:, 0]
-                peak = float(signal.max()) if signal.max() > 0 else 1.0
-                normalised = (signal / peak).tolist()
-                canvas.set_data([(label, normalised, hex_color, do_fill)], self._duration_ms)
-
-            # ── Video-Features (T_v, 3) ─────────────────────────────
-            video_features: np.ndarray = VideoFeatureExtractor.extract_video_features(
-                self._session
-            )
-            T_v = video_features.shape[0]
-
-            video_canvases = self._canvases[
-                self._n_audio_tracks : self._n_audio_tracks + self._n_video_tracks
-            ]
-            for canvas, (label, col_idx, hex_color, do_fill) in zip(
-                video_canvases, _VIDEO_FEATURE_TRACKS
-            ):
-                signal_raw = video_features[:, col_idx]  # (T_v,)
-
-                # Interpoliere auf die Audio-Auflösung (T_a Frames), damit
-                # Cursor und Zeitachse für alle Lanes identisch sind.
-                if T_v >= 2 and T_a >= 2:
-                    x_old = np.linspace(0.0, 1.0, T_v)
-                    x_new = np.linspace(0.0, 1.0, T_a)
-                    signal_resampled = np.interp(x_new, x_old, signal_raw)
-                else:
-                    signal_resampled = signal_raw
-
-                peak = float(signal_resampled.max()) if signal_resampled.max() > 0 else 1.0
-                normalised = (signal_resampled / peak).tolist()
-                canvas.set_data([(label, normalised, hex_color, do_fill)], self._duration_ms)
-
-            # ── Status bar ─────────────────────────────────────────────
-            rms_col = audio_features[:, 0]
-            n_minima = sum(
-                1 for i in range(1, T_a - 1)
-                if rms_col[i] < rms_col[i - 1]
-                and rms_col[i] < rms_col[i + 1]
-                and rms_col[i] < 0.30 * float(rms_col.max())
-            )
-            hop_ms = (self._duration_ms / T_a) if T_a > 0 else 0
-            self._status.setText(
-                f"  Audio: {T_a} Frames  ·  ~{hop_ms:.0f} ms/Frame  ·  "
-                f"Ø RMS {float(np.mean(rms_col)):.4f}  ·  "
-                f"{n_minima} RMS-Minima (< 30 % Peak)  ·  "
-                f"Video: {T_v} Frames  ·  ECR / ARR / pHash / SSIM / ROI"
-            )
-        except Exception as exc:
-            self._status.setText(f"Fehler beim Berechnen: {exc}")
-
-    # ------------------------------------------------------------------ slots
-    def _sync_cursor(self) -> None:
-        pos = float(self._player.position())
-        for canvas in self._canvases:
-            canvas.set_cursor(pos)
-
-    def _on_seek(self, ms: float) -> None:
-        self._player.setPosition(int(ms))
-        if self._player.playbackState() != QMediaPlayer.PlaybackState.PlayingState:
-            self._player.play()
-            self._player.pause()
-
-    def closeEvent(self, event) -> None:
-        self._timer.stop()
-        super().closeEvent(event)
 
 
 class AnnotationWindow(QWidget):
     """
-    Annotation page shown after a recording has been stopped.
+    Annotation page shown after a recording has been stopped. Orchestrates
+    the player, toolbar, and bottom bar, and delegates to EventsPanelWidget
+    and FeatureDialog rather than building either itself.
     """
 
     back_requested = Signal()
-    TOLERANCE_MS: float = 250.0
 
     def __init__(self, parent: QWidget | None = None) -> None:
         """
         Initialize the AnnotationWindow.
-        :param parent: The parent widget.
-        """
 
+        :param parent: The parent widget.
+        :return: None
+        """
         super().__init__(parent)
 
         self._session: RecordingSession | None = None
         self._events: list[dict] = []
-        self._event_rows: list[_EventRow] = []
         self._boundaries: list[dict] = []
         self._boundary_path: Path | None = None
         self._duration_ms: float = 0.0
-        self._rms_dialog: _RmsVisualizerDialog | None = None
+        self._feature_dialog: FeatureDialog | None = None
 
         self._player = QMediaPlayer(self)
         self._audio = QAudioOutput(self)
@@ -890,18 +238,18 @@ class AnnotationWindow(QWidget):
 
     def load_session(self, session: RecordingSession) -> None:
         """
-        Load the recording session.
+        Load a recording session into the player and event panel.
+
         :param session: The recording session.
         :return: None
         """
-
         self._session = session
         self._boundaries = []
         self._boundary_path = session.session_dir / "ground_truth.json"
         self._duration_ms = 0.0
 
         self._events = self._read_events(session.events_path)
-        self._populate_event_panel()
+        self._events_panel.set_events(self._events)
 
         self._player.setSource(QUrl.fromLocalFile(str(session.recording_path)))
 
@@ -911,10 +259,10 @@ class AnnotationWindow(QWidget):
 
     def _build_ui(self) -> None:
         """
-        Build the annotation window UI.
+        Build the toolbar, video/event-panel splitter, and bottom bar.
+
         :return: None
         """
-
         root = QVBoxLayout(self)
         root.setContentsMargins(0, 0, 0, 0)
         root.setSpacing(0)
@@ -930,9 +278,10 @@ class AnnotationWindow(QWidget):
         self._player.setVideoOutput(self._video_widget)
         splitter.addWidget(self._video_widget)
 
-        event_panel = self._build_event_panel()
-        event_panel.setFixedWidth(280)
-        splitter.addWidget(event_panel)
+        self._events_panel = EventsPanelWidget()
+        self._events_panel.setFixedWidth(280)
+        self._events_panel.jumped.connect(self._seek_to)
+        splitter.addWidget(self._events_panel)
         splitter.setCollapsible(1, False)
         splitter.setStretchFactor(0, 1)
 
@@ -941,10 +290,10 @@ class AnnotationWindow(QWidget):
 
     def _build_toolbar(self) -> QWidget:
         """
-        Build the toolbar for the annotation window.
+        Build the top toolbar.
+
         :return: The widget containing the toolbar.
         """
-
         toolbar = QWidget()
         toolbar.setFixedHeight(46)
         toolbar.setStyleSheet("background:#f7f7f7; border-bottom:1px solid #ddd;")
@@ -1009,58 +358,19 @@ class AnnotationWindow(QWidget):
             "QPushButton:hover{background:#d0e4ff;border-color:#4da3ff;}"
             "QPushButton:pressed{background:#bdd4f8;}"
         )
-        self._features_button.clicked.connect(self._show_rms_visualizer)
+        self._features_button.clicked.connect(self._show_feature_dialog)
         layout.addWidget(self._features_button)
         layout.addSpacing(6)
 
         layout.addWidget(self._boundary_count_label)
         return toolbar
 
-    def _build_event_panel(self) -> QWidget:
-        """
-        Build the event panel.
-        :return: The widget containing the event panel.
-        """
-
-        panel = QFrame()
-        panel.setStyleSheet("QFrame{background:#fafafa;}")
-
-        layout = QVBoxLayout(panel)
-        layout.setContentsMargins(0, 0, 0, 0)
-        layout.setSpacing(0)
-
-        header = QLabel(f"  Events  ·  ±{int(self.TOLERANCE_MS)} ms  ·  klicken zum Springen")
-        header.setFixedHeight(32)
-        header.setStyleSheet(
-            "background:#f0f0f0; color:#777; font-size:11px;"
-            "border-bottom:1px solid #e0e0e0; padding-left:4px;"
-        )
-
-        layout.addWidget(header)
-
-        self._event_scroll = QScrollArea()
-        self._event_scroll.setWidgetResizable(True)
-        self._event_scroll.setFrameShape(QFrame.Shape.NoFrame)
-        self._event_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
-
-        self._event_container = QWidget()
-        self._event_container.setStyleSheet("background:#fafafa;")
-        self._event_vbox = QVBoxLayout(self._event_container)
-        self._event_vbox.setContentsMargins(4, 4, 4, 4)
-        self._event_vbox.setSpacing(1)
-        self._event_vbox.addStretch()
-
-        self._event_scroll.setWidget(self._event_container)
-        layout.addWidget(self._event_scroll)
-
-        return panel
-
     def _build_bottom_bar(self) -> QWidget:
         """
-        Build the bottom bar for the annotation window.
+        Build the bottom bar with progress slider and transport controls.
+
         :return: The widget containing the bottom bar.
         """
-
         bar = QWidget()
         bar.setFixedHeight(90)
         bar.setStyleSheet("background:#f7f7f7; border-top:1px solid #ddd;")
@@ -1127,12 +437,12 @@ class AnnotationWindow(QWidget):
     @staticmethod
     def _build_multimedia_button(text: str, tooltip: str) -> QPushButton:
         """
-        Build the multimedia button (e.g., play/pause, start/end, etc.)
+        Build a styled transport button.
+
         :param text: The button text.
         :param tooltip: The button tooltip.
-        :return: The push button
+        :return: The push button.
         """
-
         b = QPushButton(text)
         b.setToolTip(tooltip)
         b.setCursor(Qt.CursorShape.PointingHandCursor)
@@ -1146,108 +456,68 @@ class AnnotationWindow(QWidget):
 
         return b
 
-    def _populate_event_panel(self) -> None:
-        """
-        Populate the event panel with the list of events.
-        :return: None
-        """
-
-        for row in self._event_rows:
-            self._event_vbox.removeWidget(row)
-            row.deleteLater()
-
-        self._event_rows.clear()
-
-        for ev in self._events:
-            row = _EventRow(ev, self._event_container)
-            row.jumped.connect(self._seek_to)
-            self._event_vbox.insertWidget(self._event_vbox.count() - 1, row)
-            self._event_rows.append(row)
-
     def _on_tick(self) -> None:
         """
-        Handle the tick event.
+        Update time label, progress slider, and event highlighting.
+
         :return: None
         """
-
         pos_ms = self._player.position()
-        self._time_label.setText(_fmt_ms(float(pos_ms)))
+        self._time_label.setText(format_ms(float(pos_ms)))
 
         if self._duration_ms > 0:
             self._slider.blockSignals(True)
             self._slider.setValue(int(pos_ms / self._duration_ms * 1000))
             self._slider.blockSignals(False)
 
-        self._highlight_events(float(pos_ms))
-
-    def _highlight_events(self, pos_ms: float) -> None:
-        """
-        Highlight the events at the given position.
-        :param pos_ms: The position in milliseconds.
-        :return: None
-        """
-
-        tol = self.TOLERANCE_MS
-        first_active: _EventRow | None = None
-
-        for row in self._event_rows:
-            ev_ms = row.event_data.get("t_ms", 0.0)
-            active = abs(ev_ms - pos_ms) <= tol
-            past = ev_ms < pos_ms - tol
-            row.set_active(active, past)
-
-            if active and first_active is None:
-                first_active = row
-
-        if first_active is not None:
-            self._event_scroll.ensureWidgetVisible(first_active)
+        self._events_panel.highlight(float(pos_ms))
 
     def _on_duration_changed(self, duration_ms: int) -> None:
         """
-        Handle the duration change event.
+        Update duration label and slider markers.
+
         :param duration_ms: The duration in milliseconds.
         :return: None
         """
-
         self._duration_ms = float(duration_ms)
-        self._duration_label.setText(_fmt_ms(float(duration_ms)))
+        self._duration_label.setText(format_ms(float(duration_ms)))
 
         if self._duration_ms > 0:
             fractions = [
                 ev.get("t_ms", 0.0) / self._duration_ms
                 for ev in self._events
-                if ev.get("type") in _MARKER_TYPES
+                if ev.get("type") in MARKER_TYPES
             ]
 
             self._slider.set_markers(fractions)
 
     def _on_playback_state_changed(self, state) -> None:
         """
-        Handle the playback state change event.
+        Update the play/pause button label.
+
         :param state: The playback state.
         :return: None
         """
-
         playing = state == QMediaPlayer.PlaybackState.PlayingState
         self._play_button.setText("⏸" if playing else "▶")
 
     def _on_media_status_changed(self, status) -> None:
         """
-        Handles the media status change event.
+        Pre-buffer a paused frame once media has loaded.
+
         :param status: The media status.
         :return: None
         """
-
         if status == QMediaPlayer.MediaStatus.LoadedMedia:
             self._player.play()
             self._player.pause()
 
     def _toggle_play(self) -> None:
         """
-        Toggle the play/pause state of the video.
+        Toggle play/pause.
+
         :return: None
         """
-
         if self._player.playbackState() == QMediaPlayer.PlaybackState.PlayingState:
             self._player.pause()
         else:
@@ -1255,30 +525,30 @@ class AnnotationWindow(QWidget):
 
     def _seek_to(self, ms: float) -> None:
         """
-        Set the playback position to the given time in milliseconds.
-        :param ms: The time in milliseconds.
+        Set the playback position.
+
+        :param ms: The target time in milliseconds.
         :return: None
         """
-
         self._player.setPosition(int(ms))
 
     def _seek_relative(self, delta_ms: int) -> None:
         """
-        Seek relative to the current playback position by the given number of milliseconds.
-        :param delta_ms: The number of milliseconds to seek relative to the current position.
+        Seek relative to the current playback position, clamped to bounds.
+
+        :param delta_ms: Offset in milliseconds, may be negative.
         :return: None
         """
-
         target = max(0, min(self._player.position() + delta_ms, int(self._duration_ms)))
         self._player.setPosition(target)
 
     def _on_slider_moved(self, value: int) -> None:
         """
-        Handles the slider value change event.
-        :param value: The new slider value.
-        :return: Nonw
-        """
+        Seek the player to match the dragged slider position.
 
+        :param value: The new slider value.
+        :return: None
+        """
         if self._duration_ms > 0:
             self._player.setPosition(int(value / 1000 * self._duration_ms))
             if self._player.playbackState() != QMediaPlayer.PlaybackState.PlayingState:
@@ -1287,20 +557,20 @@ class AnnotationWindow(QWidget):
 
     def _reload_video(self) -> None:
         """
-        Reload the video.
+        Reload the current session's video source.
+
         :return: None
         """
-
         if self._session is not None:
             self._player.setSource(QUrl())
             self._player.setSource(QUrl.fromLocalFile(str(self._session.recording_path)))
 
     def _set_boundary(self) -> None:
         """
-        Set a boundary at the current playback position.
+        Record a boundary at the current playback position.
+
         :return: None
         """
-
         pos_ms = float(self._player.position())
         self._boundaries.append(
             {
@@ -1316,10 +586,10 @@ class AnnotationWindow(QWidget):
 
     def _show_boundary_dialog(self) -> None:
         """
-        Show the boundary dialog.
+        Open the boundary management dialog and apply its result.
+
         :return: None
         """
-
         dlg = _BoundaryDialog(self._boundaries, parent=self)
         dlg.exec()
         self._boundaries = dlg.get_boundaries()
@@ -1328,10 +598,10 @@ class AnnotationWindow(QWidget):
 
     def _write_boundaries(self) -> None:
         """
-        Write the boundaries to the JSON file.
+        Persist the current boundaries to the ground-truth JSON file.
+
         :return: None
         """
-
         if self._boundary_path is None:
             return
         with self._boundary_path.open("w", encoding="utf-8") as fh:
@@ -1339,19 +609,19 @@ class AnnotationWindow(QWidget):
 
     def _update_boundary_count(self) -> None:
         """
-        Update the boundary count label.
+        Refresh the boundary count label.
+
         :return: None
         """
-
         boundary_count = len(self._boundaries)
         self._boundary_count_label.setText(f"{boundary_count} Grenze{'n' if boundary_count != 1 else ''} gesetzt")
 
     def _flash_boundary_button(self) -> None:
         """
-        Flash the boundary button.
+        Briefly highlight the boundary button after setting a boundary.
+
         :return: None
         """
-
         self._boundary_button.setStyleSheet(
             "QPushButton{background:#e8f5e9;color:#2e7d32;border:1.5px solid #4caf50;"
             "border-radius:5px;font-size:13px;font-weight:600;padding:0 16px;}"
@@ -1361,7 +631,8 @@ class AnnotationWindow(QWidget):
 
     def _apply_boundary_idle_style(self) -> None:
         """
-        Apply the idle style to the boundary button.
+        Restore the boundary button's idle stylesheet.
+
         :return: None
         """
         self._boundary_button.setStyleSheet(
@@ -1371,26 +642,24 @@ class AnnotationWindow(QWidget):
             "QPushButton:pressed{background:#ffd6c4;}"
         )
 
-    def _show_rms_visualizer(self) -> None:
+    def _show_feature_dialog(self) -> None:
         """
-        Open (or re-focus) the RMS energy visualizer dialog for the current session.
+        Open (or re-focus) the feature visualizer dialog.
+
+        :return: None
         """
         if self._session is None:
             return
 
-        # close stale dialog if session changed
-        if self._rms_dialog is not None:
-            self._rms_dialog.close()
-            self._rms_dialog = None
+        if self._feature_dialog is not None:
+            self._feature_dialog.close()
+            self._feature_dialog = None
 
-        # Lazy-Import wie bei den anderen Feature-Extraktoren: vermeidet,
-        # dass schwere Abhängigkeiten (librosa/numpy/scipy) schon beim
-        # App-Start geladen werden, statt erst beim Öffnen des Dialogs.
         from docupilot.segmentation.feature_extraction import EventFeatureExtractor
 
         event_markers = EventFeatureExtractor.extract_event_markers(self._session)
 
-        self._rms_dialog = _RmsVisualizerDialog(
+        self._feature_dialog = FeatureDialog(
             player=self._player,
             session=self._session,
             duration_ms=self._duration_ms,
@@ -1398,14 +667,14 @@ class AnnotationWindow(QWidget):
             event_markers=event_markers,
             parent=self,
         )
-        self._rms_dialog.show()
+        self._feature_dialog.show()
 
     def _on_back(self) -> None:
         """
-        Resets the player and timer.
+        Stop playback and signal that the page should be left.
+
         :return: None
         """
-
         self._player.stop()
         self._timer.stop()
         self.back_requested.emit()
@@ -1413,11 +682,11 @@ class AnnotationWindow(QWidget):
     @staticmethod
     def _read_events(path: Path) -> list[dict]:
         """
-        Read the events from the JSON file.
-        :param path: The path to the JSON file.
-        :return: A list of event dictionaries.
-        """
+        Read events from a session's events.json file.
 
+        :param path: Path to the events.json file.
+        :return: List of event dictionaries, empty if missing or invalid.
+        """
         try:
             with path.open(encoding="utf-8") as fh:
                 data = json.load(fh)
