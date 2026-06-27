@@ -551,54 +551,62 @@ class TranscriptionExtractor:
         return full_text, words
 
 
-class VerbChangeDetector:
+class SentenceSegmenter:
     """
-    Detects verb changes in a German transcript using spaCy POS tagging and
-    returns the timestamp of each verb change as an event marker.
+    Segments a German transcript into sentences with timestamps using spaCy.
 
-    Covers all German morphological constructions:
-      - Imperativ:           "Öffne den Dialog"       → ROOT, Mood=Imp
-      - Aktiv Präsens:       "Ich öffne den Dialog"   → ROOT, pos_=VERB
-      - Werden-Passiv:       "wird geöffnet"           → werden ROOT + oc child
-      - Modalverb+Infinitiv: "Sie können öffnen"       → AUX ROOT + oc child
+    Replaces the former VerbChangeDetector. Verb-level analysis and ellipsis
+    detection have been removed — sentence-type classification is now handled
+    entirely by the NLI classifier in SemanticAudioFeatureExtractor, following
+    the taxonomy of Vander Linden (1995) and Safa et al. (2026):
 
-    Uses de_core_news_lg for robust German dependency parsing.
+      ACTION      → user is instructed to perform an action  → boundary
+      RESULT      → software reacts / state change described → no boundary
+      PRECONDITION→ prerequisite stated                      → no boundary
+      BACKGROUND  → context or explanation given             → no boundary
+
+    Uses de_core_news_lg for sentence boundary detection; falls back to
+    de_core_news_md or de_core_news_sm when lg is not installed.
     """
 
     _MODEL_NAME = "de_core_news_lg"
-
-    # Verbs that carry no action semantics in instructional context.
-    _STOP_VERBS = {
-        "sein", "haben", "werden", "können", "müssen", "sollen",
-        "wollen", "dürfen", "mögen", "lassen", "gehen", "kommen",
-        "machen", "sehen", "sagen", "wissen", "geben", "stehen",
-    }
+    _MODEL_FALLBACKS = ["de_core_news_md", "de_core_news_sm"]
 
     @staticmethod
-    def detect_verb_changes(
+    def segment(
         full_text: str,
         words: List[dict],
     ) -> List[Tuple[float, str]]:
         """
-        Detect verb changes and return timeline event markers.
+        Split the transcript into sentences and return their timestamps.
 
         :param full_text: Full transcript string as returned by Whisper.
         :param words: Flat list of Whisper word dicts with "word", "start",
             and "end" keys (times in seconds).
-        :return: List of (t_ms, verb_lemma) tuples sorted by time.  Returns an
-            empty list when no verb changes are found or the transcript is empty.
+        :return: List of (t_ms, sentence_text) tuples sorted by time.
+            Returns an empty list when the transcript is empty.
         """
-
         if not full_text or not words:
             return []
 
-        import spacy  # deferred — only load when verb detection is requested
+        import spacy  # deferred
 
-        nlp = spacy.load(VerbChangeDetector._MODEL_NAME)
+        nlp = None
+        for model_name in [SentenceSegmenter._MODEL_NAME, *SentenceSegmenter._MODEL_FALLBACKS]:
+            try:
+                nlp = spacy.load(model_name)
+                break
+            except OSError:
+                continue
+        if nlp is None:
+            raise OSError(
+                "Kein deutsches spaCy-Modell gefunden. Bitte installieren:\n"
+                "  python -m spacy download de_core_news_lg"
+            )
+
         doc = nlp(full_text)
 
-        # Build a lookup list of (char_offset, start_s) from Whisper words
-        # so we can map each spaCy sentence back to a timestamp.
+        # Build char-offset → timestamp lookup from Whisper word list.
         char_to_time: List[Tuple[int, float]] = []
         char_cursor = 0
         for w in words:
@@ -609,7 +617,6 @@ class VerbChangeDetector:
                 char_cursor = pos
 
         def _resolve_time(char_idx: int) -> float:
-            """Return the best-matching word start time for a character offset."""
             if not char_to_time:
                 return 0.0
             best_t = char_to_time[0][1]
@@ -620,129 +627,75 @@ class VerbChangeDetector:
                     break
             return best_t
 
-        def _extract_action_verb(sent) -> str | None:
-            """
-            Extract the action verb lemma from a spaCy sentence.
-            Returns None if no action verb is found or lemma is a stop verb.
-            Covers: Imperativ, Aktiv, Werden-Passiv, Modalverb+Infinitiv.
-
-            Filters out system-reaction sentences where the subject is an
-            expletive "es" (e.g. "Es öffnet sich...") — these describe what
-            the software does, not what the user is instructed to do.
-            """
-            for token in sent:
-                # Werden-Passiv: "wird geöffnet" — werden is ROOT, Partizip via oc
-                if token.lemma_ == "werden" and token.dep_ == "ROOT":
-                    for child in token.children:
-                        if child.dep_ == "oc" and child.pos_ == "VERB":
-                            lemma = child.lemma_.lower()
-                            if lemma not in VerbChangeDetector._STOP_VERBS:
-                                return lemma
-                    continue
-
-                # Imperativ / Aktiv Präsens: ROOT is a content VERB
-                if token.dep_ == "ROOT" and token.pos_ == "VERB":
-                    lemma = token.lemma_.lower()
-                    if lemma not in VerbChangeDetector._STOP_VERBS:
-                        # Subjekt-Filter: expletives "es" als Subjekt = Systemreaktion
-                        # z.B. "Es öffnet sich..." → keine Nutzer-Aktion → None
-                        subjects = [
-                            c for c in token.children
-                            if c.dep_ in ("sb", "nsubj", "nsubjpass")
-                        ]
-                        if subjects and subjects[0].lemma_.lower() == "es":
-                            return None
-                        return lemma
-
-                # Modalverb + Infinitiv: "Sie können öffnen" — AUX is ROOT
-                if token.dep_ == "ROOT" and token.pos_ == "AUX":
-                    for child in token.children:
-                        if child.dep_ == "oc" and child.pos_ == "VERB":
-                            lemma = child.lemma_.lower()
-                            if lemma not in VerbChangeDetector._STOP_VERBS:
-                                return lemma
-
-            return None
-
-        markers: List[Tuple[float, str]] = []
-        prev_root_lemma: str | None = None
-        prev_sent_start: float = -999.0
-
+        sentences: List[Tuple[float, str]] = []
         for sent in doc.sents:
-            current_lemma = _extract_action_verb(sent)
-            if current_lemma is None:
+            text = sent.text.strip()
+            if not text:
+                continue
+            # Expletiv-"es"-Filter: Sätze wie "Es öffnet sich..." oder
+            # "Es erscheint ein Menü" sind Systemreaktionen — keine Nutzer-Aktion.
+            # Erkennbar daran dass das erste inhaltliche Subjekt ein Expletiv-"es"
+            # (dep_="sb" oder "nsubj") mit Lemma "es" ist.
+            # Diese Sätze werden vor dem NLI-Aufruf ausgeschlossen.
+            is_system_reaction = any(
+                token.lemma_.lower() == "es"
+                and token.dep_ in ("sb", "nsubj", "nsubjpass", "ep")
+                for token in sent
+            )
+            if is_system_reaction:
                 continue
             t_s = _resolve_time(sent.start_char)
-            # Emit a marker when EITHER the lemma changes OR enough time has
-            # passed since the last emission (same verb in a new sentence =
-            # new boundary, e.g. "klickt" appearing 3x in different steps).
-            time_gap = t_s - prev_sent_start
-            if current_lemma != prev_root_lemma or time_gap > _VERB_CLUSTER_GAP_S:
-                markers.append((t_s * 1000.0, current_lemma))
-                prev_root_lemma = current_lemma
-                prev_sent_start = t_s
+            sentences.append((t_s * 1000.0, text))
 
-        return markers
+        return sentences
 
 
-# Maximum gap (seconds) between two verbs to be considered the same cluster.
-# 4.0s war zu groß: Bei kurzen Instruktionsvideos (~18s, 3 Grenzen) landen
-# alle Verben in einem einzigen Cluster. 2.0s trennt "klickt(0.5s)→klickt(4.5s)"
-# korrekt in zwei Cluster.
-_VERB_CLUSTER_GAP_S = 2.0
+# ── NLI configuration ─────────────────────────────────────────────────────────
 
-# Minimum NLI confidence score to emit a boundary candidate.
+# NLI hypothesis template — definiert die semantische Frage die das Modell
+# für jeden Satz beantwortet. Das Modell prüft ob der Satz die Hypothese
+# impliziert (Entailment). Der Platzhalter {} wird durch das candidate_label
+# ersetzt, sodass die vollständige Hypothese lautet:
+#   "Dieser Satz ist eine direkte Handlungsanweisung an einen menschlichen
+#    Benutzer, eine Aktion in der Software auszuführen."
+# Systemreaktionen ("Ein Fenster öffnet sich"), Ergebnisse und Kontext
+# implizieren diese Hypothese nicht → niedriger Entailment-Score.
+_NLI_HYPOTHESIS_TEMPLATE = (
+    "Dieser Satz ist eine direkte Handlungsanweisung an einen menschlichen "
+    "Benutzer, eine Aktion in der Software auszuführen: {}."
+)
+_NLI_CANDIDATE_LABELS = ["wahr", "falsch"]
+_ACTION_LABEL = "wahr"
+
+# Minimum NLI confidence score for a sentence to be accepted as ACTION.
 _NLI_THRESHOLD = 0.65
 
 # Minimum gap (seconds) between two boundary candidates to avoid duplicates.
-# 3.0s war zu groß für kurze Sessions. 2.0s erlaubt G1(~0.5s)→G2(~4.5s)→G3(~10s).
 _MIN_BOUNDARY_GAP_S = 2.0
-
-# NLI candidate labels (German — model is multilingual).
-# Formuliert als konkrete Aussagen über Instruktionsvideo-Sätze, nicht abstrakt.
-# Positiv-Label beschreibt Nutzer-Aktion, Negativ-Label explizit System-Reaktion.
-_NLI_LABELS = [
-    "Der Sprecher fordert den Benutzer auf, eine neue Aktion in der Software auszuführen.",
-    "Der Sprecher beschreibt was die Software gerade tut oder was passiert ist.",
-]
 
 
 class SemanticAudioFeatureExtractor:
     """
     Extracts semantic boundary features from the audio transcript of a
-    RecordingSession.
+    RecordingSession using a four-class NLI sentence-type classifier.
 
-    Builds on top of TranscriptionExtractor and VerbChangeDetector and adds
-    three frame-aligned feature channels that capture whether a given audio
-    frame is near a semantically detected action boundary:
+    Sentence-type taxonomy (Vander Linden 1995; Safa et al. 2026):
+      ACTION      → user is instructed to perform an action  → boundary
+      RESULT      → software reacts / state change described → no boundary
+      PRECONDITION→ prerequisite stated                      → no boundary
+      BACKGROUND  → context or explanation given             → no boundary
 
-      Column 0 — verb_cluster_boundary: 1.0 at frames where a new verb cluster
-                  begins (i.e., a verb-change after a gap > _VERB_CLUSTER_GAP_S),
-                  0.0 elsewhere.
-      Column 1 — nli_boundary_score:     The NLI confidence score [0, 1] of the
-                  closest boundary candidate within a ±_NLI_SPREAD_S window,
-                  0.0 outside any window.
-      Column 2 — nli_boundary_flag:      Hard 0/1 threshold of column 1 at
-                  _NLI_THRESHOLD.
+    Pipeline:
+      1. SentenceSegmenter  — splits transcript into (t_ms, sentence) pairs
+      2. mDeBERTa Zero-Shot — classifies each sentence into the four types
+      3. Frame alignment    — writes ACTION scores as Gaussian into (T, 3) array
 
-    All three channels are aligned to the same frame grid as AudioFeatureExtractor
-    (hop_length=512, sr from librosa.load), so they can be stacked directly with
-    the 5 prosodic features to form a (T, 8) feature matrix.
-
-    Usage:
-
-        session = RecordingSession(...)
-        full_text, words = TranscriptionExtractor.extract_transcript(session)
-        audio, sr = librosa.load(session.recording_path)
-        n_frames = 1 + (len(audio) - _FRAME_LENGTH) // _HOP_LENGTH
-
-        feats = SemanticAudioFeatureExtractor.extract_semantic_features(
-            full_text, words, n_frames, sr) # shape: (n_frames, 3)
+    Output columns (aligned to AudioFeatureExtractor frame grid):
+      Col 0 — sentence_boundary:  1.0 at frames where any sentence starts
+      Col 1 — action_score:       Gaussian-weighted NLI score for ACTION sentences
+      Col 2 — action_flag:        Hard 0/1 threshold of col 1 at _NLI_THRESHOLD
     """
 
-    # Half-width (seconds) of the Gaussian spread applied around each boundary
-    # candidate when writing nli_boundary_score into the frame array.
-    # A narrower value = sharper peak, wider = smoother.
     _NLI_SPREAD_S = 1.5
 
     @staticmethod
@@ -761,7 +714,6 @@ class SemanticAudioFeatureExtractor:
         :param sampling_rate: Audio sampling rate returned by librosa.load.
         :return: np.ndarray of shape (n_frames, 3), dtype float32.
         """
-
         features = np.zeros((n_frames, 3), dtype=np.float32)
 
         if not full_text or not words:
@@ -769,41 +721,18 @@ class SemanticAudioFeatureExtractor:
 
         frames_per_second = sampling_rate / _HOP_LENGTH
 
-        # ── Step 1: Verb changes (spaCy) ──────────────────────────────────────
-        verb_markers = VerbChangeDetector.detect_verb_changes(full_text, words)
-        # verb_markers: [(t_ms, lemma), ...]  sorted by time
-
-        if not verb_markers:
+        # ── Step 1: Sentence segmentation ─────────────────────────────────────
+        sentences = SentenceSegmenter.segment(full_text, words)
+        if not sentences:
             return features
 
-        # ── Step 2: Verb cluster formation ────────────────────────────────────
-        # Group verbs that appear within _VERB_CLUSTER_GAP_S of each other.
-        # A boundary candidate is emitted at the *start* of each new cluster
-        # (index >= 1), not at every individual verb change.
-        clusters: List[List[Tuple[float, str]]] = []
-        current_cluster: List[Tuple[float, str]] = [verb_markers[0]]
-
-        for t_ms, lemma in verb_markers[1:]:
-            t_s = t_ms / 1000.0
-            prev_t_s = current_cluster[-1][0] / 1000.0
-            if t_s - prev_t_s <= _VERB_CLUSTER_GAP_S:
-                current_cluster.append((t_ms, lemma))
-            else:
-                clusters.append(current_cluster)
-                current_cluster = [(t_ms, lemma)]
-        clusters.append(current_cluster)
-
-        # Mark cluster-boundary frames (column 0) — first verb of each cluster
-        # including cluster 0 (= start of first instruction).
-        for cluster in clusters:
-            t_s = cluster[0][0] / 1000.0
-            frame_idx = int(round(t_s * frames_per_second))
+        # ── Step 2: Mark all sentence-start frames (column 0) ─────────────────
+        for t_ms, _ in sentences:
+            frame_idx = int(round((t_ms / 1000.0) * frames_per_second))
             if 0 <= frame_idx < n_frames:
                 features[frame_idx, 0] = 1.0
 
-        # ── Step 3: NLI announcement classification ───────────────────────────
-        # Classify the first sentence of each cluster transition via Zero-Shot NLI.
-        # Lazy import, so the heavy model is only loaded when this method is called.
+        # ── Step 3: NLI sentence-type classification ───────────────────────────
         from transformers import pipeline  # deferred
 
         zero_shot = pipeline(
@@ -811,42 +740,36 @@ class SemanticAudioFeatureExtractor:
             model="MoritzLaurer/mDeBERTa-v3-base-xnli-multilingual-nli-2mil7",
         )
 
-        # Build a sentence lookup from the Whisper word list: for each cluster
-        # transition we need the sentence that contains the trigger verb.
-        sentence_map = SemanticAudioFeatureExtractor._build_sentence_map(words)
-
-        # Cluster 0 is always a boundary — it marks the start of the first
-        # instruction. No NLI check needed; score is set to 1.0 by convention.
-        first_t_s = clusters[0][0][0] / 1000.0
+        # Sentence 0 is always an ACTION boundary (start of first instruction).
+        first_t_s = sentences[0][0] / 1000.0
         boundary_candidates: List[Tuple[float, float]] = [(first_t_s, 1.0)]
-        last_boundary_t_s: float = first_t_s
+        last_boundary_t_s = first_t_s
 
-        for cluster in clusters[1:]:
-            trigger_t_s = cluster[0][0] / 1000.0
-            sentence = SemanticAudioFeatureExtractor._sentence_at(
-                sentence_map, trigger_t_s
+        for t_ms, sentence_text in sentences[1:]:
+            t_s = t_ms / 1000.0
+
+            result = zero_shot(
+                sentence_text,
+                candidate_labels=_NLI_CANDIDATE_LABELS,
+                hypothesis_template=_NLI_HYPOTHESIS_TEMPLATE,
             )
-            if not sentence:
-                continue
-
-            result = zero_shot(sentence, _NLI_LABELS)
-            is_announcement = result["labels"][0] == _NLI_LABELS[0]
+            top_label = result["labels"][0]
             score = float(result["scores"][0])
 
-            if not is_announcement or score < _NLI_THRESHOLD:
+            # Only ACTION sentences trigger boundaries.
+            if top_label != _ACTION_LABEL or score < _NLI_THRESHOLD:
                 continue
 
-            # Enforce minimum gap between consecutive boundaries.
-            if trigger_t_s - last_boundary_t_s < _MIN_BOUNDARY_GAP_S:
-                # Keep the higher-confidence one.
-                if boundary_candidates and score > boundary_candidates[-1][1]:
-                    boundary_candidates[-1] = (trigger_t_s, score)
+            # Enforce minimum gap — keep higher-confidence candidate on collision.
+            if t_s - last_boundary_t_s < _MIN_BOUNDARY_GAP_S:
+                if score > boundary_candidates[-1][1]:
+                    boundary_candidates[-1] = (t_s, score)
                 continue
 
-            boundary_candidates.append((trigger_t_s, score))
-            last_boundary_t_s = trigger_t_s
+            boundary_candidates.append((t_s, score))
+            last_boundary_t_s = t_s
 
-        # ── Step 4: Write NLI scores into frame arrays (columns 1 & 2) ────────
+        # ── Step 4: Write ACTION scores into frame arrays (columns 1 & 2) ──────
         spread_frames = int(SemanticAudioFeatureExtractor._NLI_SPREAD_S * frames_per_second)
 
         for t_s, score in boundary_candidates:
@@ -854,11 +777,9 @@ class SemanticAudioFeatureExtractor:
             lo = max(0, center - spread_frames)
             hi = min(n_frames, center + spread_frames + 1)
 
-            # Gaussian envelope centred on the boundary frame.
             offsets = np.arange(lo, hi) - center
             gaussian = np.exp(-0.5 * (offsets / max(spread_frames / 2, 1)) ** 2)
 
-            # Column 1: weighted NLI score.
             features[lo:hi, 1] = np.maximum(
                 features[lo:hi, 1], (score * gaussian).astype(np.float32)
             )
@@ -867,59 +788,6 @@ class SemanticAudioFeatureExtractor:
         features[:, 2] = (features[:, 1] >= _NLI_THRESHOLD).astype(np.float32)
 
         return features
-
-    # ── Helpers ───────────────────────────────────────────────────────────────
-
-    @staticmethod
-    def _build_sentence_map(words: List[dict]) -> List[Tuple[float, float, str]]:
-        """
-        Build a coarse sentence map from Whisper word dicts by grouping words
-        separated by a pause > 1.0s into pseudo-sentences.
-
-        :return: List of (start_s, end_s, sentence_text) triples.
-        """
-        if not words:
-            return []
-
-        sentences: List[Tuple[float, float, str]] = []
-        group: List[dict] = [words[0]]
-
-        for w in words[1:]:
-            gap = float(w.get("start", 0.0)) - float(group[-1].get("end", 0.0))
-            if gap > 0.6:  # war 1.0s — zu groß für natürliche Sprechpausen zwischen Sätzen
-                start_s = float(group[0].get("start", 0.0))
-                end_s = float(group[-1].get("end", 0.0))
-                text = " ".join(x.get("word", "").strip() for x in group)
-                sentences.append((start_s, end_s, text.strip()))
-                group = [w]
-            else:
-                group.append(w)
-
-        if group:
-            start_s = float(group[0].get("start", 0.0))
-            end_s = float(group[-1].get("end", 0.0))
-            text = " ".join(x.get("word", "").strip() for x in group)
-            sentences.append((start_s, end_s, text.strip()))
-
-        return sentences
-
-    @staticmethod
-    def _sentence_at(
-        sentence_map: List[Tuple[float, float, str]],
-        t_s: float,
-    ) -> str:
-        """
-        Return the sentence text that covers timestamp t_s, or the nearest one.
-        """
-        if not sentence_map:
-            return ""
-        best = sentence_map[0][2]
-        for start_s, end_s, text in sentence_map:
-            if start_s <= t_s <= end_s:
-                return text
-            if start_s <= t_s:
-                best = text
-        return best
 
 
 # Window size to track events in seconds
