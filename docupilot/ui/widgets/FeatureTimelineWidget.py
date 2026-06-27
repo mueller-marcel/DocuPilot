@@ -40,6 +40,9 @@ class FeatureTimelineWidget(QWidget):
         self._boundaries: list[float] = []
         self._events: list[tuple[float, str]] = []
         self._event_color = event_color
+        # Semantic marker state — only used by the NLI lane
+        self._cluster_markers: list[tuple[float, str]] = []   # (t_ms, "verb_cluster")
+        self._flag_markers:    list[tuple[float, str]] = []   # (t_ms, "nli_flag")
         self.setMinimumHeight(160)
         self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
         self.setCursor(Qt.CursorShape.CrossCursor)
@@ -84,6 +87,24 @@ class FeatureTimelineWidget(QWidget):
         :return: None
         """
         self._events = events
+        self.update()
+
+    def set_semantic_markers(
+        self,
+        cluster_markers: list[tuple[float, str]],
+        flag_markers: list[tuple[float, str]],
+    ) -> None:
+        """
+        Set semantic boundary markers for the NLI lane.
+
+        :param cluster_markers: List of (t_ms, "verb_cluster") — drawn as thin
+            violet vertical lines marking where a new verb cluster starts.
+        :param flag_markers: List of (t_ms, "nli_flag") — drawn as filled
+            diamond shapes marking hard NLI boundary candidates.
+        :return: None
+        """
+        self._cluster_markers = cluster_markers
+        self._flag_markers = flag_markers
         self.update()
 
     def mousePressEvent(self, event) -> None:
@@ -211,6 +232,48 @@ class FeatureTimelineWidget(QWidget):
             for ev_ms, _ev_type in self._events:
                 ex = pl + int(ev_ms / self._duration_ms * plot_w)
                 p.drawEllipse(int(ex - radius), int(marker_y - radius), radius * 2, radius * 2)
+
+        # ── Semantic markers (NLI lane only) ──────────────────────────────────
+        if self._duration_ms > 0 and (self._cluster_markers or self._flag_markers):
+            # 1. Verb-cluster boundaries: thin violet dashed vertical lines
+            cluster_pen = QPen(QColor("#a78bfa"))
+            cluster_pen.setWidth(1)
+            cluster_pen.setStyle(Qt.PenStyle.DashLine)
+            for t_ms, _ in self._cluster_markers:
+                cx_ = pl + int(t_ms / self._duration_ms * plot_w)
+                p.setPen(cluster_pen)
+                p.drawLine(cx_, pt, cx_, pt + plot_h)
+                # Small label "V" at top
+                p.setPen(QColor("#a78bfa"))
+                p.setFont(QFont("monospace", 7))
+                p.drawText(cx_ + 2, pt + 2, 12, 12, Qt.AlignmentFlag.AlignLeft, "V")
+
+            # 2. NLI hard-flag candidates: filled diamond at mid-height
+            diamond_color = QColor("#f0abfc")   # fuchsia — distinct from curve violet
+            p.setPen(Qt.PenStyle.NoPen)
+            p.setBrush(QBrush(diamond_color))
+            mid_y = pt + plot_h // 2
+            r = 6
+            for t_ms, _ in self._flag_markers:
+                fx = pl + int(t_ms / self._duration_ms * plot_w)
+                # Diamond: four points around center
+                from PySide6.QtGui import QPolygon
+                from PySide6.QtCore import QPoint
+                diamond = QPolygon([
+                    QPoint(fx,     mid_y - r),   # top
+                    QPoint(fx + r, mid_y),        # right
+                    QPoint(fx,     mid_y + r),   # bottom
+                    QPoint(fx - r, mid_y),        # left
+                ])
+                p.drawPolygon(diamond)
+                # Thin outline for clarity
+                outline_pen = QPen(QColor("#ffffff"))
+                outline_pen.setWidth(1)
+                p.setPen(outline_pen)
+                p.setBrush(Qt.BrushStyle.NoBrush)
+                p.drawPolygon(diamond)
+                p.setPen(Qt.PenStyle.NoPen)
+                p.setBrush(QBrush(diamond_color))
 
         p.end()
 

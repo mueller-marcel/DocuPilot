@@ -17,9 +17,10 @@ from docupilot.recording.session import RecordingSession
 
 from docupilot.ui.widgets.FeatureTimelineWidget import FeatureTimelineWidget
 
-_AUDIO_COLOR = "#ef4444"
-_VIDEO_COLOR = "#22c55e"
-_EVENT_COLOR = "#38bdf8"
+_AUDIO_COLOR    = "#ef4444"
+_VIDEO_COLOR    = "#22c55e"
+_EVENT_COLOR    = "#38bdf8"
+_SEMANTIC_COLOR = "#a78bfa"   # violet — NLI boundary score curve
 
 _FEATURE_TRACKS: list[tuple[str, slice, str, bool]] = [
     ("RMS  (roh)", slice(0, 1), _AUDIO_COLOR, True),
@@ -162,6 +163,21 @@ class FeatureDialog(QDialog):
         self._event_canvas.set_data([], self._duration_ms)
         self._event_canvas.set_events(self._event_markers)
 
+        separator_semantic = QFrame()
+        separator_semantic.setFrameShape(QFrame.Shape.HLine)
+        separator_semantic.setStyleSheet("color:#333355; margin:6px 0;")
+        lanes_layout.addWidget(separator_semantic)
+        semantic_header = QLabel("  ►  Semantische Merkmale (NLI Boundary-Kandidaten)")
+        semantic_header.setFixedHeight(24)
+        semantic_header.setStyleSheet(
+            "color:#aaa; font-size:11px; font-style:italic; background:#1e1e2e; padding-left:6px;"
+        )
+        lanes_layout.addWidget(semantic_header)
+
+        self._semantic_canvas = _add_lane(
+            "NLI-Score  +  Verb-Cluster  +  Boundary-Flag", _SEMANTIC_COLOR, False, height=180
+        )
+
         lanes_layout.addStretch()
         scroll.setWidget(lanes_widget)
         root.addWidget(scroll, stretch=1)
@@ -254,6 +270,61 @@ class FeatureDialog(QDialog):
                 f"{n_minima} RMS-Minima (< 30 % Peak)  ·  "
                 f"Video: {T_v} Frames  ·  ECR / ARR / pHash / SSIM / ROI"
             )
+
+            # ── Semantische Features ──────────────────────────────────────────
+            # Computed separately because they require Whisper + spaCy + NLI,
+            # which are significantly slower than the signal-processing features.
+            try:
+                import librosa
+                from docupilot.segmentation.feature_extraction import (
+                    TranscriptionExtractor,
+                    SemanticAudioFeatureExtractor,
+                )
+
+                full_text, words = TranscriptionExtractor.extract_transcript(self._session)
+                audio_raw, sr = librosa.load(str(self._session.recording_path))
+                semantic_features = SemanticAudioFeatureExtractor.extract_semantic_features(
+                    full_text, words, T_a, float(sr)
+                )  # shape: (T_a, 3)
+
+                # col 0: verb_cluster_boundary — hard 0/1 spike at cluster starts
+                # col 1: nli_boundary_score   — Gaussian-weighted NLI confidence
+                # col 2: nli_boundary_flag    — hard threshold of col 1
+
+                nli_score_signal = semantic_features[:, 1].tolist()  # already [0,1]
+
+                # Verb-cluster boundary timestamps → event markers for the canvas
+                # (drawn as vertical tick marks via set_semantic_cluster_markers)
+                cluster_frames = np.where(semantic_features[:, 0] > 0.5)[0]
+                hop_s = (self._duration_ms / 1000.0) / T_a if T_a > 0 else 0.0
+                cluster_markers_ms = [
+                    (int(f) * hop_s * 1000.0, "verb_cluster") for f in cluster_frames
+                ]
+
+                # NLI hard-flag timestamps → boundary candidate markers
+                flag_frames = np.where(semantic_features[:, 2] > 0.5)[0]
+                flag_markers_ms = [
+                    (int(f) * hop_s * 1000.0, "nli_flag") for f in flag_frames
+                ]
+
+                self._semantic_canvas.set_data(
+                    [("NLI-Score", nli_score_signal, _SEMANTIC_COLOR, True)],
+                    self._duration_ms,
+                )
+                self._semantic_canvas.set_semantic_markers(
+                    cluster_markers=cluster_markers_ms,
+                    flag_markers=flag_markers_ms,
+                )
+
+                n_candidates = len(flag_frames)
+                self._status.setText(
+                    self._status.text()
+                    + f"  ·  Semantik: {n_candidates} NLI-Boundary-Kandidaten"
+                )
+
+            except Exception as sem_exc:
+                self._semantic_canvas.set_data([], self._duration_ms)
+                self._status.setText(self._status.text() + f"  ·  Semantik: Fehler ({sem_exc})")
         except Exception as exc:
             self._status.setText(f"Fehler beim Berechnen: {exc}")
 
