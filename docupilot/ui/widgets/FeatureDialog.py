@@ -17,26 +17,10 @@ from docupilot.recording.session import RecordingSession
 
 from docupilot.ui.widgets.FeatureTimelineWidget import FeatureTimelineWidget
 
-_AUDIO_COLOR    = "#ef4444"
-_VIDEO_COLOR    = "#22c55e"
-_EVENT_COLOR    = "#38bdf8"
-_SEMANTIC_COLOR = "#a78bfa"   # violet — NLI boundary score curve
-
-_FEATURE_TRACKS: list[tuple[str, slice, str, bool]] = [
-    ("RMS  (roh)", slice(0, 1), _AUDIO_COLOR, True),
-    ("Pausendauer", slice(1, 2), _AUDIO_COLOR, True),
-    ("Pitch-Reset", slice(2, 3), _AUDIO_COLOR, True),
-    ("Energie-Sprung", slice(3, 4), _AUDIO_COLOR, True),
-    ("Sprechtempo", slice(4, 5), _AUDIO_COLOR, True),
-]
-
-_VIDEO_FEATURE_TRACKS: list[tuple[str, int, str, bool]] = [
-    ("ECR  (Kanten-änderung)",    0, _VIDEO_COLOR, True),
-    ("ARR  (Flächen-änderung)",   1, _VIDEO_COLOR, True),
-    ("pHash (Struktur-änderung)", 2, _VIDEO_COLOR, True),
-    ("SSIM  (Wahrnehmung)",       3, _VIDEO_COLOR, True),
-    ("ROI   (Titelleiste)",       4, _VIDEO_COLOR, True),
-]
+_GROUND_TRUTH_COLOR = "#34d399"
+_EVENT_COLOR        = "#38bdf8"
+_SEMANTIC_COLOR     = "#a78bfa"
+_GUI_COLOR          = "#fb923c"
 
 
 class FeatureDialog(QDialog):
@@ -46,6 +30,14 @@ class FeatureDialog(QDialog):
     columns: RMS, pause duration, pitch reset, energy jump, speech rate.
     Shares cursor and boundary lines across all timelines; clicking a
     timeline seeks the player.
+
+    Ground-Truth-Grenzen werden ausschließlich aus
+    session.ground_truth_markers() bezogen — sowohl für die gestrichelten
+    Grenzlinien in allen Lanes als auch für die dedizierte Ground-Truth-Lane.
+    Es gibt dadurch nur EINE Quelle: unabhängig davon, ob die Session gerade
+    aufgezeichnet wurde oder über "Datei > Öffnen" geladen wurde, zeigt
+    FeatureDialog exakt dieselben Grenzen. Die Lane erscheint nur, wenn
+    mindestens eine Grenze gesetzt wurde.
     """
 
     def __init__(
@@ -53,7 +45,6 @@ class FeatureDialog(QDialog):
         player: QMediaPlayer,
         session: RecordingSession,
         duration_ms: float,
-        boundaries: list[dict],
         event_markers: list[tuple[float, str]] | None = None,
         parent: QWidget | None = None,
     ) -> None:
@@ -61,15 +52,15 @@ class FeatureDialog(QDialog):
         Build the dialog and start async feature computation.
 
         :param player: Media player providing playback position and seeking.
-        :param session: Recording session to load features from.
+        :param session: Recording session to load features from. Liefert die
+            Ground-Truth-Grenzen über session.ground_truth_markers().
         :param duration_ms: Total recording duration in milliseconds.
-        :param boundaries: Ground-truth boundary dicts with a t_ms key.
         :param event_markers: Pre-extracted (t_ms, event_type) markers.
         :param parent: Parent widget.
         :return: None
         """
         super().__init__(parent)
-        self.setWindowTitle("Feature-Verläufe · Audio & Video · Visualisierung")
+        self.setWindowTitle("Feature-Verläufe · Semantik & GUI · Visualisierung")
         self.setMinimumSize(820, 700)
         self.resize(1100, 950)
         self.setModal(False)
@@ -77,18 +68,39 @@ class FeatureDialog(QDialog):
         self._player = player
         self._session = session
         self._duration_ms = duration_ms
-        self._boundaries_ms = [b.get("t_ms", 0.0) for b in boundaries]
+
+        # Falls der Player die Dauer zum Zeitpunkt der Konstruktion bereits
+        # kennt, direkt übernehmen — das erspart einen unnötigen Wartezyklus
+        # bis zum ersten _sync_cursor-Tick. Ist sie noch nicht bekannt (0),
+        # übernimmt _sync_cursor() bzw. _compute_features() die Korrektur
+        # automatisch, sobald der Player sie ermittelt hat.
+        live_duration = float(self._player.duration())
+        if live_duration > 0:
+            self._duration_ms = live_duration
+
         self._event_markers: list[tuple[float, str]] = event_markers or []
+
+        # Einzige Quelle für alle Grenzen-Darstellungen: die dashed Linien
+        # (_boundaries_ms) UND die dedizierte Ground-Truth-Lane
+        # (_ground_truth_markers) stammen aus demselben Aufruf, damit sie
+        # niemals auseinanderlaufen können.
+        self._ground_truth_markers: list[tuple[float, str]] = session.ground_truth_markers()
+        self._boundaries_ms: list[float] = [t_ms for t_ms, _ in self._ground_truth_markers]
+
         self._canvases: list[FeatureTimelineWidget] = []
 
         root = QVBoxLayout(self)
         root.setContentsMargins(14, 14, 14, 10)
         root.setSpacing(8)
 
-        header = QLabel(
-            "Audio-Features (rot) + Video-Features (grün)  ·  gestrichelt = gesetzte Grenzen  ·  "
-            "eigene Zeitleiste unten = Events (hellblau)  ·  Klick auf Timeline → Sprung im Video"
+        header_text = (
+            "Semantik (violett)  ·  GUI-Zustandsänderungen (orange)  ·  "
+            "Events (hellblau)  ·  gestrichelt = gesetzte Grenzen  ·  Klick auf Timeline → Sprung im Video"
         )
+        if self._ground_truth_markers:
+            header_text += "  ·  Ground Truth (grün)"
+
+        header = QLabel(header_text)
         header.setStyleSheet("color:#aaa; font-size:11px;")
         root.addWidget(header)
 
@@ -103,6 +115,34 @@ class FeatureDialog(QDialog):
         lanes_layout = QVBoxLayout(lanes_widget)
         lanes_layout.setContentsMargins(0, 0, 0, 0)
         lanes_layout.setSpacing(2)
+
+        def _add_separator() -> None:
+            """
+            Fügt eine dünne horizontale Trennlinie zwischen zwei Lane-Gruppen ein.
+
+            Extrahiert, weil dieselben drei Zeilen vorher vor jeder Lane-Gruppe
+            wiederholt wurden (DRY).
+
+            :return: None
+            """
+            separator = QFrame()
+            separator.setFrameShape(QFrame.Shape.HLine)
+            separator.setStyleSheet("color:#333355; margin:6px 0;")
+            lanes_layout.addWidget(separator)
+
+        def _add_section_header(text: str) -> None:
+            """
+            Fügt eine kursive Sektions-Überschrift oberhalb einer Lane-Gruppe ein.
+
+            :param text: Anzuzeigender Text, z. B. "  ►  Events (...)".
+            :return: None
+            """
+            lbl = QLabel(text)
+            lbl.setFixedHeight(24)
+            lbl.setStyleSheet(
+                "color:#aaa; font-size:11px; font-style:italic; background:#1e1e2e; padding-left:6px;"
+            )
+            lanes_layout.addWidget(lbl)
 
         def _add_lane(label: str, hex_color: str, do_fill: bool, *, height: int = 140) -> FeatureTimelineWidget:
             """
@@ -129,53 +169,41 @@ class FeatureDialog(QDialog):
             self._canvases.append(c)
             return c
 
-        self._n_audio_tracks = len(_FEATURE_TRACKS)
-        for _label, _col_slice, hex_color, do_fill in _FEATURE_TRACKS:
-            _add_lane(_label, hex_color, do_fill)
+        # ── Ground Truth (4. Lane, nur falls Grenzen gesetzt wurden) ───────
+        self._ground_truth_canvas: FeatureTimelineWidget | None = None
+        if self._ground_truth_markers:
+            _add_separator()
+            _add_section_header(
+                f"  ►  Ground Truth ({len(self._ground_truth_markers)} gesetzte Grenzen)"
+            )
+            self._ground_truth_canvas = _add_lane(
+                "Ground Truth", _GROUND_TRUTH_COLOR, False, height=100
+            )
+            self._ground_truth_canvas.set_data([], self._duration_ms)
+            self._ground_truth_canvas.set_events(self._ground_truth_markers)
 
-        separator = QFrame()
-        separator.setFrameShape(QFrame.Shape.HLine)
-        separator.setStyleSheet("color:#333355; margin:6px 0;")
-        lanes_layout.addWidget(separator)
-        vid_header = QLabel("  ►  Video-Features (ECR / ARR / pHash / SSIM / ROI)")
-        vid_header.setFixedHeight(24)
-        vid_header.setStyleSheet(
-            "color:#aaa; font-size:11px; font-style:italic; background:#1e1e2e; padding-left:6px;"
-        )
-        lanes_layout.addWidget(vid_header)
-
-        self._n_video_tracks = len(_VIDEO_FEATURE_TRACKS)
-        for _label, _col_idx, hex_color, do_fill in _VIDEO_FEATURE_TRACKS:
-            _add_lane(_label, hex_color, do_fill)
-
-        separator_events = QFrame()
-        separator_events.setFrameShape(QFrame.Shape.HLine)
-        separator_events.setStyleSheet("color:#333355; margin:6px 0;")
-        lanes_layout.addWidget(separator_events)
-        event_header = QLabel("  ►  Events (Klick / Taste / Scroll)")
-        event_header.setFixedHeight(24)
-        event_header.setStyleSheet(
-            "color:#aaa; font-size:11px; font-style:italic; background:#1e1e2e; padding-left:6px;"
-        )
-        lanes_layout.addWidget(event_header)
+        # ── Events ───────────────────────────────────────────────────────
+        _add_separator()
+        _add_section_header("  ►  Events (Klick / Taste / Scroll)")
 
         self._event_canvas = _add_lane("Events", _EVENT_COLOR, False)
         self._event_canvas.set_data([], self._duration_ms)
         self._event_canvas.set_events(self._event_markers)
 
-        separator_semantic = QFrame()
-        separator_semantic.setFrameShape(QFrame.Shape.HLine)
-        separator_semantic.setStyleSheet("color:#333355; margin:6px 0;")
-        lanes_layout.addWidget(separator_semantic)
-        semantic_header = QLabel("  ►  Semantische Merkmale (NLI Boundary-Kandidaten)")
-        semantic_header.setFixedHeight(24)
-        semantic_header.setStyleSheet(
-            "color:#aaa; font-size:11px; font-style:italic; background:#1e1e2e; padding-left:6px;"
-        )
-        lanes_layout.addWidget(semantic_header)
+        # ── Semantik ─────────────────────────────────────────────────────
+        _add_separator()
+        _add_section_header("  ►  Semantische Merkmale (NLI Boundary-Kandidaten)")
 
         self._semantic_canvas = _add_lane(
             "NLI-Score  +  Verb-Cluster  +  Boundary-Flag", _SEMANTIC_COLOR, False, height=180
+        )
+
+        # ── GUI ──────────────────────────────────────────────────────────
+        _add_separator()
+        _add_section_header("  ►  GUI-Handlungsgrenzen (OmniParser: neue & modifizierte Elemente)")
+
+        self._gui_canvas = _add_lane(
+            "GUI-Boundary-Score  +  Onset-Flag  +  Boundary-Flag", _GUI_COLOR, False, height=180
         )
 
         lanes_layout.addStretch()
@@ -207,106 +235,51 @@ class FeatureDialog(QDialog):
 
     def _compute_features(self) -> None:
         """
-        Extract audio/video features and populate all canvas lanes.
+        Extract semantic and GUI features and populate all canvas lanes.
 
         :return: None
         """
         try:
-            from docupilot.segmentation.feature_extraction import (
-                AudioFeatureExtractor,
-                VideoFeatureExtractor,
-            )
             import numpy as np
-
-            audio_features: np.ndarray = AudioFeatureExtractor.extract_audio_features(
-                self._session
+            import librosa
+            from docupilot.segmentation.feature_extraction import (
+                TranscriptionExtractor,
+                SemanticAudioFeatureExtractor,
+                GUIActionBoundaryExtractor,
             )
-            T_a = audio_features.shape[0]
 
-            audio_canvases = self._canvases[: self._n_audio_tracks]
-            for canvas, (label, col_slice, hex_color, do_fill) in zip(
-                audio_canvases, _FEATURE_TRACKS
-            ):
-                signal = audio_features[:, col_slice][:, 0]
-                peak = float(signal.max()) if signal.max() > 0 else 1.0
-                normalised = (signal / peak).tolist()
-                canvas.set_data([(label, normalised, hex_color, do_fill)], self._duration_ms)
-
-            video_features: np.ndarray = VideoFeatureExtractor.extract_video_features(
-                self._session
-            )
-            T_v = video_features.shape[0]
-
-            video_canvases = self._canvases[
-                self._n_audio_tracks : self._n_audio_tracks + self._n_video_tracks
-            ]
-            for canvas, (label, col_idx, hex_color, do_fill) in zip(
-                video_canvases, _VIDEO_FEATURE_TRACKS
-            ):
-                signal_raw = video_features[:, col_idx]
-
-                if T_v >= 2 and T_a >= 2:
-                    x_old = np.linspace(0.0, 1.0, T_v)
-                    x_new = np.linspace(0.0, 1.0, T_a)
-                    signal_resampled = np.interp(x_new, x_old, signal_raw)
-                else:
-                    signal_resampled = signal_raw
-
-                peak = float(signal_resampled.max()) if signal_resampled.max() > 0 else 1.0
-                normalised = (signal_resampled / peak).tolist()
-                canvas.set_data([(label, normalised, hex_color, do_fill)], self._duration_ms)
-
-            rms_col = audio_features[:, 0]
-            n_minima = sum(
-                1 for i in range(1, T_a - 1)
-                if rms_col[i] < rms_col[i - 1]
-                and rms_col[i] < rms_col[i + 1]
-                and rms_col[i] < 0.30 * float(rms_col.max())
-            )
-            hop_ms = (self._duration_ms / T_a) if T_a > 0 else 0
-            self._status.setText(
-                f"  Audio: {T_a} Frames  ·  ~{hop_ms:.0f} ms/Frame  ·  "
-                f"Ø RMS {float(np.mean(rms_col)):.4f}  ·  "
-                f"{n_minima} RMS-Minima (< 30 % Peak)  ·  "
-                f"Video: {T_v} Frames  ·  ECR / ARR / pHash / SSIM / ROI"
-            )
+            # _compute_features läuft 50ms nach dem Öffnen des Dialogs — noch
+            # bevor der erste _sync_cursor-Tick (80ms) die Dauer korrigieren
+            # konnte. Deshalb hier zusätzlich direkt beim Player nachfragen,
+            # damit hop_s (und damit alle Semantik-/GUI-Markerpositionen)
+            # nicht versehentlich mit einer noch unbekannten Dauer von 0
+            # berechnet werden.
+            live_duration = float(self._player.duration())
+            if live_duration > 0:
+                self._duration_ms = live_duration
+                for canvas in self._canvases:
+                    canvas.set_duration(live_duration)
 
             # ── Semantische Features ──────────────────────────────────────────
-            # Computed separately because they require Whisper + spaCy + NLI,
-            # which are significantly slower than the signal-processing features.
             try:
-                import librosa
-                from docupilot.segmentation.feature_extraction import (
-                    TranscriptionExtractor,
-                    SemanticAudioFeatureExtractor,
-                )
-
                 full_text, words = TranscriptionExtractor.extract_transcript(self._session)
                 audio_raw, sr = librosa.load(str(self._session.recording_path))
+                _HOP_LENGTH = 512
+                T_sem = 1 + (len(audio_raw) - 2048) // _HOP_LENGTH
                 semantic_features = SemanticAudioFeatureExtractor.extract_semantic_features(
-                    full_text, words, T_a, float(sr)
-                )  # shape: (T_a, 3)
+                    full_text, words, T_sem, float(sr)
+                )
 
-                # col 0: verb_cluster_boundary — hard 0/1 spike at cluster starts
-                # col 1: nli_boundary_score   — Gaussian-weighted NLI confidence
-                # col 2: nli_boundary_flag    — hard threshold of col 1
-
-                nli_score_signal = semantic_features[:, 1].tolist()  # already [0,1]
-
-                # Verb-cluster boundary timestamps → event markers for the canvas
-                # (drawn as vertical tick marks via set_semantic_cluster_markers)
+                nli_score_signal = semantic_features[:, 1].tolist()
                 cluster_frames = np.where(semantic_features[:, 0] > 0.5)[0]
-                hop_s = (self._duration_ms / 1000.0) / T_a if T_a > 0 else 0.0
+                hop_s = (self._duration_ms / 1000.0) / T_sem if T_sem > 0 else 0.0
                 cluster_markers_ms = [
                     (int(f) * hop_s * 1000.0, "verb_cluster") for f in cluster_frames
                 ]
-
-                # NLI hard-flag timestamps → boundary candidate markers
                 flag_frames = np.where(semantic_features[:, 2] > 0.5)[0]
                 flag_markers_ms = [
                     (int(f) * hop_s * 1000.0, "nli_flag") for f in flag_frames
                 ]
-
                 self._semantic_canvas.set_data(
                     [("NLI-Score", nli_score_signal, _SEMANTIC_COLOR, True)],
                     self._duration_ms,
@@ -315,16 +288,52 @@ class FeatureDialog(QDialog):
                     cluster_markers=cluster_markers_ms,
                     flag_markers=flag_markers_ms,
                 )
-
-                n_candidates = len(flag_frames)
                 self._status.setText(
-                    self._status.text()
-                    + f"  ·  Semantik: {n_candidates} NLI-Boundary-Kandidaten"
+                    f"  Semantik: {len(flag_frames)} NLI-Boundary-Kandidaten"
                 )
-
             except Exception as sem_exc:
                 self._semantic_canvas.set_data([], self._duration_ms)
-                self._status.setText(self._status.text() + f"  ·  Semantik: Fehler ({sem_exc})")
+                self._status.setText(f"  Semantik: Fehler ({sem_exc})")
+
+            # ── GUI-Zustandsänderungen (OmniParser) ───────────────────────────
+            try:
+                import cv2 as _cv2
+                _cap = _cv2.VideoCapture(str(self._session.recording_path))
+                fps = _cap.get(_cv2.CAP_PROP_FPS) or 25.0
+                T_v = int(_cap.get(_cv2.CAP_PROP_FRAME_COUNT))
+                _cap.release()
+
+                gui_features = GUIActionBoundaryExtractor.extract_gui_features(
+                    self._session,
+                    fps=fps,
+                )
+
+                gui_score_signal = gui_features[:, 1].tolist()
+                keyframe_frames = np.where(gui_features[:, 0] > 0.5)[0]
+                hop_s_v = (self._duration_ms / 1000.0) / T_v if T_v > 0 else 0.0
+                keyframe_markers_ms = [
+                    (int(f) * hop_s_v * 1000.0, "onset") for f in keyframe_frames
+                ]
+                gui_flag_frames = np.where(gui_features[:, 2] > 0.5)[0]
+                gui_flag_markers_ms = [
+                    (int(f) * hop_s_v * 1000.0, "gui_boundary") for f in gui_flag_frames
+                ]
+                self._gui_canvas.set_data(
+                    [("GUI-Boundary-Score", gui_score_signal, _GUI_COLOR, True)],
+                    self._duration_ms,
+                )
+                self._gui_canvas.set_semantic_markers(
+                    cluster_markers=keyframe_markers_ms,
+                    flag_markers=gui_flag_markers_ms,
+                )
+                self._status.setText(
+                    self._status.text()
+                    + f"  ·  GUI: {len(gui_flag_frames)} Boundary-Kandidaten"
+                )
+            except Exception as gui_exc:
+                self._gui_canvas.set_data([], self._duration_ms)
+                self._status.setText(self._status.text() + f"  ·  GUI: Fehler ({gui_exc})")
+
         except Exception as exc:
             self._status.setText(f"Fehler beim Berechnen: {exc}")
 
@@ -332,9 +341,25 @@ class FeatureDialog(QDialog):
         """
         Broadcast the current playback position to all canvases.
 
+        Fragt bei jedem Tick zusätzlich die LIVE-Dauer des Players ab. War
+        self._duration_ms beim Aufbau des Dialogs noch 0 (z. B. weil der
+        Media-Player die Dauer einer gerade geöffneten Datei noch nicht
+        ermittelt hatte), wird sie hier automatisch nachgetragen — an ALLE
+        Lanes gleichzeitig, egal ob Aufnahme oder geöffnete Session. Ohne
+        das würde jede Marker-Zeichnung (Grenzen, Events, Cursor, Semantik)
+        für immer unsichtbar bleiben, da sie in FeatureTimelineWidget an
+        "duration_ms > 0" gekoppelt ist.
+
         :return: None
         """
         pos = float(self._player.position())
+        live_duration = float(self._player.duration())
+
+        if live_duration > 0 and live_duration != self._duration_ms:
+            self._duration_ms = live_duration
+            for canvas in self._canvases:
+                canvas.set_duration(live_duration)
+
         for canvas in self._canvases:
             canvas.set_cursor(pos)
 

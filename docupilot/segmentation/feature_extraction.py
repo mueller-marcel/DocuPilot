@@ -1,513 +1,476 @@
 from typing import List, Tuple
 from pathlib import Path
-from scipy.signal import find_peaks
 
 from docupilot.recording.session import RecordingSession
 
 import json
-import librosa
 import numpy as np
 
 # Hop length used consistently across all feature extractions.
 # At sr=22050 (librosa default): 512 samples ≈ 23 ms per frame.
 _HOP_LENGTH = 512
 
-# Frame length used for both RMS and pitch extraction so that both end up
-# with the same number of frames (T) and stay perfectly aligned.
-_FRAME_LENGTH = 2048
 
-# Fundamental-frequency range for speech (covers low male to high female
-# voices); used by the YIN pitch tracker.
-_F0_MIN = 80.0
-_F0_MAX = 400.0
+# ── GUI Action Boundary Extractor ─────────────────────────────────────────────
+#
+# Detects action boundary EVIDENCE from screen recordings. A GUI state
+# transition is located via pHash (cheap pre-filter only) and semantically
+# verified via OmniParser: did new UI elements appear, or were existing
+# elements modified in content?
+#
+# DESIGN PRINCIPLE (experiment-ready):
+#   Extractors emit graded, calibrated evidence in [0, 1]. They make NO
+#   boundary decisions. Thresholding, minimum-gap suppression and peak
+#   picking happen ONCE, downstream, in the dataset builder / fusion head —
+#   identically for every modality. Only then is a difference between two
+#   modality subsets attributable to the modality itself, not to
+#   per-extractor decision logic (required for the Shapley ablation).
+#
+# Scientific basis:
+#   - Lu et al. (2024). OmniParser for Pure Vision Based GUI Agent. arXiv:2408.00203.
+#   - Wornow et al. (2024): pixel pre-filter + semantic verification pipeline.
+#   - RippleGUItester (2025): pixel diff → bounding boxes → LLM verification.
+#   - ActionNet (Zhao et al., 2019): vision-only action segmentation in screencasts.
+#
+# Pipeline:
+#   Phase 1 — pHash scan (streaming, hashes only, no frame storage)
+#       Detects the ONSET frame of each potential transition.
+#   Phase 2 — Pixel diff on onset pairs → changed-region bounding boxes.
+#       For very strong pHash changes (full-screen transition) the pixel
+#       diff degenerates; the WHOLE FRAME is then used as the single ROI so
+#       OmniParser still verifies semantically. There is NO fast path that
+#       bypasses semantic verification.
+#   Phase 3 — OmniParser on regions → graded evidence:
+#       evidence = max over regions of max(new_element_frac, modified_frac)
+#   Phase 4 — Gaussian-spread evidence written into (T_v, 3) array.
+#
+# Output columns (shape and meaning unchanged):
+#   Col 0 — onset_flag:          1.0 at detected transition onset frames
+#   Col 1 — gui_boundary_score:  graded semantic evidence [0, 1] (was: constant 1.0)
+#   Col 2 — gui_boundary_flag:   hard 0/1 at _GUI_BOUNDARY_THRESHOLD
+#                                (backward-compat / visualisation only —
+#                                 downstream code must use col 1)
 
-# The threshold to detect silence in the RMS energy envelope.
-_SILENCE_THRESHOLD_DB = -35.0
+# pHash distance to trigger onset detection (candidate PROPOSAL only,
+# never a boundary decision).
+_PHASH_ONSET_THRESHOLD = 0.12
 
-# Minimum length (seconds) of a silent run to count as a speech pause
-# rather than a brief dip between syllables.
-_MIN_PAUSE_DURATION_S = 0.2
+# pHash distance above which the pixel diff is unreliable (full-screen
+# transition). OmniParser then runs on the whole frame as ROI instead of
+# being skipped. (Previously this threshold accepted boundaries blindly —
+# that let scrolls / video playback through as false boundaries.)
+_PHASH_FULLFRAME_THRESHOLD = 0.25
 
-# Window (seconds) immediately before/after a pause used to characterize
-# the pitch reset and energy jump across that pause.
-_BOUNDARY_WINDOW_S = 0.2
+# Frames to look back/ahead around each onset for before/after comparison.
+# At 10fps a click happens ~300ms before the visual response; 5 frames
+# (500ms) captures the pre-click GUI state even for fast users.
+_BEFORE_FRAME_OFFSET = 5
+_AFTER_FRAME_OFFSET  = 5
 
-# Window (seconds) used to estimate the local speech rate from syllable-nucleus peaks in the energy envelope.
-_SPEECH_RATE_WINDOW_S = 1.0
+# Minimum changed region: RESOLUTION-INDEPENDENT.
+# The old fraction-based value (1.5% of frame area) was calibrated for one
+# resolution and silently drifted on others (cursor ≈ 24×36 px regardless
+# of resolution class). We therefore require a region to be larger than a
+# cursor-sized box scaled to the recording height.
+_MIN_DIFF_REGION_CURSOR_SCALE = 2.5   # region must exceed 2.5 cursor areas
+_CURSOR_PX_AT_1080P = (24, 36)        # (w, h) of a typical pointer at 1080p
 
-# Minimum spacing (seconds) between two syllable-nucleus peaks.
-_MIN_SYLLABLE_SPACING_S = 0.1
+# OmniParser weights and confidence.
+_OMNIPARSER_WEIGHTS = "weights/icon_detect/model.pt"
+_OMNIPARSER_CONF    = 0.30
+
+# IoU threshold: boxes above this are considered the "same" element.
+_ELEMENT_IOU_THRESHOLD = 0.5
+
+# Normalised MSE threshold inside a matched bounding box crop.
+# If pixel content changed more than this, the element is "modified".
+_MODIFIED_MSE_THRESHOLD = 0.02
+
+# Backward-compat flag threshold for column 2 (display only).
+_GUI_BOUNDARY_THRESHOLD = 0.5
+_GUI_SPREAD_S           = 1.0
+
+# Burst de-duplication of raw pHash onsets (an animation produces many
+# consecutive onsets for ONE transition — this is signal hygiene, not a
+# boundary decision).
+_ONSET_DEDUP_WINDOW_S = 0.5
 
 
-class AudioFeatureExtractor:
+class GUIActionBoundaryExtractor:
     """
-    Service that extracts the audio features from the mp4 file.
+    Extracts graded GUI action-boundary EVIDENCE from screen recordings
+    using: pHash onset proposal → pixel-diff region extraction →
+    OmniParser semantic element comparison.
+
+    The evidence value is derived entirely from OmniParser observations
+    (fraction of new elements, fraction of modified elements). pHash and
+    pixel-diff are cheap pre-filters that decide WHERE OmniParser runs —
+    they never contribute to the evidence value itself and never make
+    boundary decisions.
     """
-
-    @staticmethod
-    def extract_audio_features(recording_session: RecordingSession) -> np.ndarray:
-        """
-        Extract the audio features from the recording session.
-
-        :param recording_session: The recording session contains the path to the mp4 file.
-        :return: np.ndarray of shape (T, 5) – one 5-dim feature vector per frame.
-        """
-
-        audio, sampling_rate = librosa.load(recording_session.recording_path)
-
-        # RMS energy
-        rms = librosa.effects.feature.rms(
-            y=audio, frame_length=_FRAME_LENGTH, hop_length=_HOP_LENGTH
-        )[0]
-
-        # Pitch
-        pitch = librosa.yin(
-            audio,
-            fmin=_F0_MIN,
-            fmax=_F0_MAX,
-            sr=sampling_rate,
-            frame_length=_FRAME_LENGTH,
-            hop_length=_HOP_LENGTH,
-        )
-
-        # Speech pauses
-        pause_segments = AudioFeatureExtractor._detect_pause_segments(rms, sampling_rate)
-
-        # Cues for speech pauses
-        pause_duration = AudioFeatureExtractor._compute_pause_duration(
-            rms, pause_segments, sampling_rate
-        )
-
-        # Pitch reset
-        pitch_reset = AudioFeatureExtractor._compute_pitch_reset(
-            pitch, pause_segments, sampling_rate
-        )
-
-        # Energy jumps
-        energy_jump = AudioFeatureExtractor._compute_energy_jump(rms, pause_segments, sampling_rate)
-
-        # Speech rate
-        speech_rate = AudioFeatureExtractor._compute_speech_rate(rms, sampling_rate)
-
-        # Number of frames to use for each feature vector.
-        n_frames = min(
-            len(rms),
-            len(pitch),
-            len(pause_duration),
-            len(pitch_reset),
-            len(energy_jump),
-            len(speech_rate),
-        )
-
-        return np.stack(
-            [
-                rms[:n_frames],
-                pause_duration[:n_frames],
-                pitch_reset[:n_frames],
-                energy_jump[:n_frames],
-                speech_rate[:n_frames],
-            ],
-            axis=1,
-        ).astype(np.float32)
-
-    @staticmethod
-    def _detect_pause_segments(
-        rms: np.ndarray, sampling_rate: int | float
-    ) -> List[Tuple[int, int]]:
-        """
-        Detect speech pauses
-        :param rms: The rms energy vector
-        :param sampling_rate: The sampling rate of the audio
-        :return: A list of tuples (start, end) of pause segments.
-        """
-
-        rms_db = librosa.amplitude_to_db(rms, ref=np.max)
-        is_silent = rms_db < _SILENCE_THRESHOLD_DB
-
-        frames_per_second = sampling_rate / _HOP_LENGTH
-        min_pause_frames = int(_MIN_PAUSE_DURATION_S * frames_per_second)
-
-        segments: List[Tuple[int, int]] = []
-        start = None
-        for i, silent in enumerate(is_silent):
-            if silent and start is None:
-                start = i
-            elif not silent and start is not None:
-                if i - start >= min_pause_frames:
-                    segments.append((start, i))
-                start = None
-        if start is not None and len(is_silent) - start >= min_pause_frames:
-            segments.append((start, len(is_silent)))
-
-        return segments
-
-    @staticmethod
-    def _compute_pause_duration(
-        rms: np.ndarray, pause_segments: List[Tuple[int, int]], sampling_rate: int | float
-    ) -> np.ndarray:
-        """
-        Compute the pause duration in seconds.
-        :param rms: The rms energy vector
-        :param pause_segments: A list of tuples (start, end) of pause segments.
-        :param sampling_rate: The sampling rate of the audio
-        :return: The array of pause durations in seconds.
-        """
-
-        feature = np.zeros(len(rms), dtype=np.float32)
-        frames_per_second = sampling_rate / _HOP_LENGTH
-        for start, end in pause_segments:
-            feature[start:end] = (end - start) / frames_per_second
-
-        return feature
-
-    @staticmethod
-    def _compute_pitch_reset(
-        pitch: np.ndarray, pause_segments: List[Tuple[int, int]], sampling_rate: int | float
-    ) -> np.ndarray:
-        """
-        Compute the pitch reset
-        :param pitch: The pitch vector
-        :param pause_segments: The pause segments
-        :param sampling_rate: The sampling rate of the audio
-        :return: A vector with the pitch reset for each frame.
-        """
-
-        feature = np.zeros(len(pitch), dtype=np.float32)
-        frames_per_second = sampling_rate / _HOP_LENGTH
-        window_frames = max(1, int(_BOUNDARY_WINDOW_S * frames_per_second))
-
-        for start, end in pause_segments:
-            before = pitch[max(0, start - window_frames) : start]
-            after = pitch[end : end + window_frames]
-            before_voiced = before[before > 0]
-            after_voiced = after[after > 0]
-            if len(before_voiced) == 0 or len(after_voiced) == 0:
-                continue
-            feature[start:end] = abs(np.median(after_voiced) - np.median(before_voiced))
-
-        return feature
-
-    @staticmethod
-    def _compute_energy_jump(
-        rms: np.ndarray, pause_segments: List[Tuple[int, int]], sampling_rate: int | float
-    ) -> np.ndarray:
-        """
-        Compute the energy jump
-        :param rms: The rms energy vector
-        :param pause_segments: The pause segments
-        :param sampling_rate: The sampling rate of the audio
-        :return: The vector with the energy jumps
-        """
-
-        feature = np.zeros(len(rms), dtype=np.float32)
-        frames_per_second = sampling_rate / _HOP_LENGTH
-        window_frames = max(1, int(_BOUNDARY_WINDOW_S * frames_per_second))
-
-        for start, end in pause_segments:
-            before = rms[max(0, start - window_frames) : start]
-            after = rms[end : end + window_frames]
-            if len(before) == 0 or len(after) == 0:
-                continue
-            feature[start:end] = abs(float(np.mean(after)) - float(np.mean(before)))
-
-        return feature
-
-    @staticmethod
-    def _compute_speech_rate(rms: np.ndarray, sampling_rate: int | float) -> np.ndarray:
-        """
-        Compute the speech rate
-        :param rms: The rms energy vector
-        :param sampling_rate: The sampling rate of the audio
-        :return: The vector with the speech rate
-        """
-
-        frames_per_second = sampling_rate / _HOP_LENGTH
-        peak_distance = max(1, int(_MIN_SYLLABLE_SPACING_S * frames_per_second))
-        peaks, _ = find_peaks(rms, distance=peak_distance, prominence=np.std(rms) * 0.5)
-
-        window_frames = max(1, int(_SPEECH_RATE_WINDOW_S * frames_per_second))
-        half_window = window_frames // 2
-
-        n_frames = len(rms)
-        frame_indices = np.arange(n_frames)
-        window_starts = np.clip(frame_indices - half_window, 0, n_frames)
-        window_ends = np.clip(frame_indices + half_window, 0, n_frames)
-        counts_low = np.searchsorted(peaks, window_starts, side="left")
-        counts_high = np.searchsorted(peaks, window_ends, side="left")
-        peak_counts = counts_high - counts_low
-
-        window_durations_s = (window_ends - window_starts) / frames_per_second
-        with np.errstate(divide="ignore", invalid="ignore"):
-            feature = np.where(window_durations_s > 0, peak_counts / window_durations_s, 0.0)
-
-        return feature.astype(np.float32)
-
-
-class VideoFeatureExtractor:
-    """
-    The service to extract video features from a recording session.
-    """
-
-    _CANNY_LOW = 50
-    _CANNY_HIGH = 150
-
-    _SAMPLE_NTH_FRAME = 1
-
-    _GAUSS_KERNEL = (5, 5)
-
-    _SMOOTHING_WINDOW_FRAMES = 5
 
     _PHASH_SIZE = 8
 
-    _ROI_HEIGHT_FRAC = 0.20
-
-    _PEAK_PROMINENCE = 0.08
+    # ── pHash helpers ─────────────────────────────────────────────────────────
 
     @staticmethod
-    def extract_video_features(recording_session: RecordingSession) -> np.ndarray:
-        """
-        Extracts video features from a recording session.
-        :param recording_session: The recording session.
-        :return: The video features.
-        """
-
-        import cv2
-
-        cap = cv2.VideoCapture(str(recording_session.recording_path))
-        if not cap.isOpened():
-            raise IOError(f"Cannot open video file: {recording_session.recording_path}")
-
-        try:
-            ecr_v, arr_v, phash_v, ssim_v, roi_v = VideoFeatureExtractor._extract_raw_features(cap)
-        finally:
-            cap.release()
-
-        if len(ecr_v) == 0:
-            return np.empty((0, 5), dtype=np.float32)
-
-        # Smooth the raw features.
-        smooth = VideoFeatureExtractor._smooth
-        cols_raw = [
-            smooth(np.array(ecr_v, dtype=np.float32)),
-            smooth(np.array(arr_v, dtype=np.float32)),
-            smooth(np.array(phash_v, dtype=np.float32)),
-            smooth(np.array(ssim_v, dtype=np.float32)),
-            smooth(np.array(roi_v, dtype=np.float32)),
-        ]
-
-        # Prominence-filter the raw features.
-        cols_prominent = [VideoFeatureExtractor._prominence_filter(col) for col in cols_raw]
-
-        features = np.stack(cols_prominent, axis=1)
-
-        return features
-
-    @staticmethod
-    def _extract_raw_features(cap) -> tuple:
-        """
-        Extract the raw features
-        :param cap: The video capture object
-        :return: A tuple of the raw features
-        """
-
-        import cv2
-
-        ecr_vector: list[float] = []
-        arr_vector: list[float] = []
-        phash_vector: list[float] = []
-        ssim_vector: list[float] = []
-        roi_vector: list[float] = []
-
-        prev_gray: np.ndarray | None = None
-        prev_edges: np.ndarray | None = None
-        prev_hash: object | None = None
-
-        frame_idx = 0
-
-        while True:
-            ret, frame_bgr = cap.read()
-            if not ret:
-                break
-
-            if frame_idx % VideoFeatureExtractor._SAMPLE_NTH_FRAME != 0:
-                frame_idx += 1
-                continue
-
-            gray = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY)
-            edges = cv2.Canny(
-                gray,
-                VideoFeatureExtractor._CANNY_LOW,
-                VideoFeatureExtractor._CANNY_HIGH,
-            )
-            h = VideoFeatureExtractor._compute_phash(gray)
-
-            if prev_gray is not None:
-                ecr_vector.append(VideoFeatureExtractor._compute_ecr(prev_edges, edges))
-                arr_vector.append(VideoFeatureExtractor._compute_arr(prev_gray, gray))
-                phash_vector.append(VideoFeatureExtractor._compute_phash_dist(prev_hash, h))
-                ssim_vector.append(VideoFeatureExtractor._compute_ssim(prev_gray, gray))
-                roi_vector.append(VideoFeatureExtractor._compute_roi_score(prev_gray, gray))
-
-            prev_gray = gray
-            prev_edges = edges
-            prev_hash = h
-            frame_idx += 1
-
-        return ecr_vector, arr_vector, phash_vector, ssim_vector, roi_vector
-
-    @staticmethod
-    def _compute_ecr(edges_prev: np.ndarray, edges_curr: np.ndarray) -> float:
-        """
-        Compute the Edge Change Ratio (ECR) of the current frame.
-        :param edges_prev: The edges of the previous frame.
-        :param edges_curr: The edges of the current frame.
-        :return: The ECR of the current frame compared to the previous frame.
-        """
-
-        import cv2
-
-        kernel = np.ones((3, 3), dtype=np.uint8)
-        dilated = cv2.dilate(edges_prev, kernel, iterations=1)
-        new_edges = cv2.bitwise_and(edges_curr, cv2.bitwise_not(dilated))
-        n_prev = float(np.count_nonzero(edges_prev))
-        n_new = float(np.count_nonzero(new_edges))
-
-        return min(n_new / (n_prev + 1e-6), 1.0)
-
-    @staticmethod
-    def _compute_arr(gray_prev: np.ndarray, gray_curr: np.ndarray) -> float:
-        """
-        Compute the Adaptive Ratio of the current frame.
-        :param gray_prev: The gray scale of the previous frame.
-        :param gray_curr: The gray scale of the current frame.
-        :return: The ARR of the current frame compared to the previous frame.
-        """
-
-        import cv2
-
-        b_prev = cv2.GaussianBlur(gray_prev, VideoFeatureExtractor._GAUSS_KERNEL, 0)
-        b_curr = cv2.GaussianBlur(gray_curr, VideoFeatureExtractor._GAUSS_KERNEL, 0)
-        diff = cv2.absdiff(b_prev, b_curr)
-        _, mask = cv2.threshold(diff, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-
-        return float(np.count_nonzero(mask)) / float(mask.size)
-
-    @staticmethod
-    def _compute_phash(gray: np.ndarray) -> object:
-        """
-        Compute the phash vector
-        :param gray: The gray scale of the current frame.
-        :return: The phash
-        """
-
+    def _phash(gray: np.ndarray) -> object:
         import imagehash
         from PIL import Image
-
         return imagehash.phash(
             Image.fromarray(gray),
-            hash_size=VideoFeatureExtractor._PHASH_SIZE,
+            hash_size=GUIActionBoundaryExtractor._PHASH_SIZE,
         )
 
     @staticmethod
-    def _compute_phash_dist(h_prev: object, h_curr: object) -> float:
-        """
-        Compute the phash distance
-        :param h_prev: The phash of the previous frame.
-        :param h_curr: The phash of the current frame.
-        :return: The phash distance
-        """
+    def _phash_dist(a: object, b: object) -> float:
+        return float(a - b) / (GUIActionBoundaryExtractor._PHASH_SIZE ** 2)
 
-        n_bits = VideoFeatureExtractor._PHASH_SIZE**2
-
-        return float(h_prev - h_curr) / n_bits
+    # ── Pixel-diff region extraction ──────────────────────────────────────────
 
     @staticmethod
-    def _compute_ssim(gray_prev: np.ndarray, gray_curr: np.ndarray) -> float:
+    def _min_region_area(h: int, w: int) -> int:
         """
-        Compute the structural similarity index (SSIM) of the current frame.
-        :param gray_prev: The gray scale of the previous frame.
-        :param gray_curr: The gray scale of the current frame.
-        :return: The SSIM of the current frame compared to the previous frame.
+        Resolution-independent minimum region area: a multiple of the
+        cursor footprint scaled to the recording height. Filters
+        cursor-only movement at ANY resolution without a hand-tuned
+        fraction that only holds for one clip.
         """
+        scale = h / 1080.0
+        cw, ch = _CURSOR_PX_AT_1080P
+        cursor_area = (cw * scale) * (ch * scale)
+        return int(cursor_area * _MIN_DIFF_REGION_CURSOR_SCALE)
 
+    @staticmethod
+    def _diff_regions(
+        before_bgr: np.ndarray,
+        after_bgr: np.ndarray,
+    ) -> list[tuple[int, int, int, int]]:
+        """
+        Return bounding boxes of connected changed regions between two frames.
+
+        :return: List of (x1, y1, x2, y2) in pixel coordinates.
+        """
         import cv2
-        from skimage.metrics import structural_similarity as ssim
 
-        target_w = 256
-        h, w = gray_prev.shape
-        if w > target_w:
-            scale = target_w / w
-            new_sz = (target_w, max(1, int(h * scale)))
-            a = cv2.resize(gray_prev, new_sz, interpolation=cv2.INTER_AREA)
-            b = cv2.resize(gray_curr, new_sz, interpolation=cv2.INTER_AREA)
-        else:
-            a, b = gray_prev, gray_curr
+        h, w = before_bgr.shape[:2]
+        min_area = GUIActionBoundaryExtractor._min_region_area(h, w)
 
-        score, _ = ssim(a, b, full=True)
-
-        return float(np.clip(1.0 - score, 0.0, 1.0))
-
-    @staticmethod
-    def _compute_roi_score(gray_prev: np.ndarray, gray_curr: np.ndarray) -> float:
-        """
-        Compute the ROI score of the current frame.
-        :param gray_prev: The gray scale of the previous frame.
-        :param gray_curr: The gray scale of the current frame.
-        :return: The roi score of the current frame compared to the previous frame.
-        """
-
-        h = gray_prev.shape[0]
-        roi_h = max(1, int(h * VideoFeatureExtractor._ROI_HEIGHT_FRAC))
-        roi_p = gray_prev[:roi_h, :].astype(np.float32)
-        roi_c = gray_curr[:roi_h, :].astype(np.float32)
-        diff = np.abs(roi_p - roi_c)
-        row_means = diff.mean(axis=1)
-
-        return float(row_means.max() / 255.0)
-
-    @staticmethod
-    def _smooth(values: np.ndarray) -> np.ndarray:
-        """
-        Smooth the given values using a moving average.
-        :param values: The values to smooth.
-        :return: The smoothed values.
-        """
-
-        w = VideoFeatureExtractor._SMOOTHING_WINDOW_FRAMES
-        if len(values) < w:
-            return values
-        kernel = np.ones(w, dtype=np.float32) / w
-
-        return np.convolve(values, kernel, mode="same").astype(np.float32)
-
-    @staticmethod
-    def _prominence_filter(values: np.ndarray) -> np.ndarray:
-        """
-        Applies the prominence filter to the given values.
-        :param values: The values to filter.
-        :return: The filtered values.
-        """
-
-        from scipy.signal import find_peaks
-
-        if len(values) < 3:
-            return values
-
-        peak = float(values.max())
-        if peak <= 0:
-            return np.zeros_like(values)
-        normed = values / peak
-
-        peaks, _ = find_peaks(
-            normed,
-            prominence=VideoFeatureExtractor._PEAK_PROMINENCE,
+        diff = cv2.absdiff(
+            cv2.cvtColor(before_bgr, cv2.COLOR_BGR2GRAY),
+            cv2.cvtColor(after_bgr,  cv2.COLOR_BGR2GRAY),
         )
+        _, mask = cv2.threshold(diff, 20, 255, cv2.THRESH_BINARY)
+        kernel  = cv2.getStructuringElement(cv2.MORPH_RECT, (15, 15))
+        mask    = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
 
-        result = np.zeros_like(normed)
-        if len(peaks) > 0:
-            result[peaks] = normed[peaks]
+        n_labels, _, stats, _ = cv2.connectedComponentsWithStats(mask)
+        boxes: list[tuple[int, int, int, int]] = []
+        for lbl in range(1, n_labels):
+            if int(stats[lbl, cv2.CC_STAT_AREA]) < min_area:
+                continue
+            x  = int(stats[lbl, cv2.CC_STAT_LEFT])
+            y  = int(stats[lbl, cv2.CC_STAT_TOP])
+            bw = int(stats[lbl, cv2.CC_STAT_WIDTH])
+            bh = int(stats[lbl, cv2.CC_STAT_HEIGHT])
+            boxes.append((x, y, x + bw, y + bh))
+        return boxes
 
-        return result.astype(np.float32)
+    # ── OmniParser element detection ──────────────────────────────────────────
+
+    @staticmethod
+    def _detect_elements(
+        model,
+        frame_bgr: np.ndarray,
+        roi: tuple[int, int, int, int],
+    ) -> list[tuple[float, float, float, float]]:
+        """
+        Run OmniParser on a cropped ROI and return detected element boxes
+        in normalised coordinates [0, 1] relative to the ROI.
+        """
+        x1, y1, x2, y2 = roi
+        crop = frame_bgr[y1:y2, x1:x2]
+        if crop.size == 0:
+            return []
+        results = model.predict(crop, verbose=False, conf=_OMNIPARSER_CONF)
+        ch, cw = crop.shape[:2]
+        boxes: list[tuple[float, float, float, float]] = []
+        for result in results:
+            for box in result.boxes.xyxy.tolist():
+                bx1, by1, bx2, by2 = box
+                boxes.append((bx1 / cw, by1 / ch, bx2 / cw, by2 / ch))
+        return boxes
+
+    @staticmethod
+    def _iou(a: tuple, b: tuple) -> float:
+        """Intersection over Union of two normalised boxes."""
+        ax1, ay1, ax2, ay2 = a
+        bx1, by1, bx2, by2 = b
+        ix1, iy1 = max(ax1, bx1), max(ay1, by1)
+        ix2, iy2 = min(ax2, bx2), min(ay2, by2)
+        inter = max(0.0, ix2 - ix1) * max(0.0, iy2 - iy1)
+        if inter == 0.0:
+            return 0.0
+        ua = (ax2 - ax1) * (ay2 - ay1)
+        ub = (bx2 - bx1) * (by2 - by1)
+        return inter / (ua + ub - inter)
+
+    # ── Graded semantic evidence ──────────────────────────────────────────────
+
+    @staticmethod
+    def _new_element_fraction(
+        before_boxes: list[tuple],
+        after_boxes:  list[tuple],
+    ) -> float:
+        """
+        Fraction of after-elements without a sufficiently overlapping match
+        in before_boxes. GRADED replacement for the former boolean
+        _has_new_elements: 0.9 (dialog opened, 90% new) is stronger
+        evidence than 0.15 (one new list row) — the Random Forest needs
+        that gradation to weigh modalities against each other.
+        """
+        if not after_boxes:
+            return 0.0
+        if not before_boxes:
+            return 1.0
+        new_count = sum(
+            1 for ab in after_boxes
+            if not any(
+                GUIActionBoundaryExtractor._iou(ab, bb) >= _ELEMENT_IOU_THRESHOLD
+                for bb in before_boxes
+            )
+        )
+        return new_count / len(after_boxes)
+
+    @staticmethod
+    def _modified_element_fraction(
+        before_boxes: list[tuple],
+        after_boxes:  list[tuple],
+        before_crop:  np.ndarray,
+        after_crop:   np.ndarray,
+    ) -> float:
+        """
+        Fraction of MATCHED elements whose pixel content changed
+        significantly inside their bounding box (list got new entry, field
+        filled, status changed). Hover highlights stay below the MSE
+        threshold. GRADED replacement for the former boolean check.
+        """
+        import cv2
+
+        if not before_boxes or not after_boxes:
+            return 0.0
+        ch, cw = before_crop.shape[:2]
+        if ch == 0 or cw == 0:
+            return 0.0
+
+        modified_count = 0
+        matched_count  = 0
+
+        for ab in after_boxes:
+            best_iou = 0.0
+            best_bb  = None
+            for bb in before_boxes:
+                iou = GUIActionBoundaryExtractor._iou(ab, bb)
+                if iou > best_iou:
+                    best_iou = iou
+                    best_bb  = bb
+            if best_bb is None or best_iou < _ELEMENT_IOU_THRESHOLD:
+                continue  # unmatched → contributes to new_element_fraction
+
+            matched_count += 1
+
+            ax1 = int(ab[0] * cw);      ay1 = int(ab[1] * ch)
+            ax2 = int(ab[2] * cw);      ay2 = int(ab[3] * ch)
+            bx1 = int(best_bb[0] * cw); by1 = int(best_bb[1] * ch)
+            bx2 = int(best_bb[2] * cw); by2 = int(best_bb[3] * ch)
+
+            crop_a = after_crop[ay1:ay2,  ax1:ax2]
+            crop_b = before_crop[by1:by2, bx1:bx2]
+            if crop_a.size == 0 or crop_b.size == 0:
+                continue
+
+            target = (max(1, ax2 - ax1), max(1, ay2 - ay1))
+            crop_b_resized = cv2.resize(crop_b, target, interpolation=cv2.INTER_AREA)
+
+            ga = cv2.cvtColor(crop_a,         cv2.COLOR_BGR2GRAY).astype(np.float32) / 255.0
+            gb = cv2.cvtColor(crop_b_resized, cv2.COLOR_BGR2GRAY).astype(np.float32) / 255.0
+            mse = float(np.mean((ga - gb) ** 2))
+            if mse > _MODIFIED_MSE_THRESHOLD:
+                modified_count += 1
+
+        if matched_count == 0:
+            return 0.0
+        return modified_count / matched_count
+
+    # ── Frame access (streaming, memory-bounded) ──────────────────────────────
+
+    @staticmethod
+    def _scan_phashes(video_path: str) -> tuple[list[object], int]:
+        """
+        Pass 1: stream all frames, keep ONLY the pHashes.
+        Memory: O(T) hashes instead of O(T) full frames — a 10-minute
+        1080p recording no longer needs ~20 GB of RAM.
+        """
+        import cv2
+        cap = cv2.VideoCapture(video_path)
+        if not cap.isOpened():
+            return [], 0
+        hashes: list[object] = []
+        try:
+            while True:
+                ret, bgr = cap.read()
+                if not ret:
+                    break
+                gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
+                hashes.append(GUIActionBoundaryExtractor._phash(gray))
+        finally:
+            cap.release()
+        return hashes, len(hashes)
+
+    @staticmethod
+    def _grab_frames(video_path: str, frame_indices: set[int]) -> dict[int, np.ndarray]:
+        """
+        Pass 2: stream again and keep only the requested frames
+        (before/after pairs around onsets). Sequential read is faster and
+        more reliable than per-frame seeking for most codecs.
+        """
+        import cv2
+        wanted = dict.fromkeys(frame_indices)
+        cap = cv2.VideoCapture(video_path)
+        if not cap.isOpened():
+            return {}
+        grabbed: dict[int, np.ndarray] = {}
+        idx = 0
+        try:
+            while wanted:
+                ret, bgr = cap.read()
+                if not ret:
+                    break
+                if idx in wanted:
+                    grabbed[idx] = bgr
+                    wanted.pop(idx)
+                idx += 1
+        finally:
+            cap.release()
+        return grabbed
+
+    # ── Main extraction ───────────────────────────────────────────────────────
+
+    @staticmethod
+    def extract_gui_features(
+        recording_session: RecordingSession,
+        fps: float,
+    ) -> np.ndarray:
+        """
+        Extract graded GUI action-boundary evidence from the video.
+
+        :param recording_session: Recording session (MP4 path).
+        :param fps: Video frame rate in frames per second.
+        :return: np.ndarray of shape (T_v, 3), dtype float32.
+        """
+        video_path = str(recording_session.recording_path)
+
+        # ── Phase 1: streaming pHash scan ──────────────────────────────────────
+        phash_list, T_v = GUIActionBoundaryExtractor._scan_phashes(video_path)
+
+        features = np.zeros((T_v, 3), dtype=np.float32)
+        if T_v < _BEFORE_FRAME_OFFSET + _AFTER_FRAME_OFFSET + 1:
+            return features
+
+        phash_dists = [0.0] + [
+            GUIActionBoundaryExtractor._phash_dist(phash_list[i - 1], phash_list[i])
+            for i in range(1, T_v)
+        ]
+
+        onset_frames = [
+            i for i in range(1, T_v) if phash_dists[i] >= _PHASH_ONSET_THRESHOLD
+        ]
+        for i in onset_frames:
+            features[i, 0] = 1.0
+
+        if not onset_frames:
+            return features
+
+        # Burst de-duplication (one transition = many consecutive onsets).
+        dedup_gap = max(1, int(fps * _ONSET_DEDUP_WINDOW_S))
+        deduped: list[int] = [onset_frames[0]]
+        for f in onset_frames[1:]:
+            if f - deduped[-1] > dedup_gap:
+                deduped.append(f)
+        onset_frames = deduped
+
+        # ── Phase 2 prep: fetch only the needed before/after frames ───────────
+        needed: set[int] = set()
+        pairs: list[tuple[int, int, int]] = []  # (onset, before_idx, after_idx)
+        for onset in onset_frames:
+            b = max(0, onset - _BEFORE_FRAME_OFFSET)
+            a = min(T_v - 1, onset + _AFTER_FRAME_OFFSET)
+            needed.update((b, a))
+            pairs.append((onset, b, a))
+        frames = GUIActionBoundaryExtractor._grab_frames(video_path, needed)
+
+        # ── Phase 2 + 3: regions → OmniParser → graded evidence ───────────────
+        from ultralytics import YOLO
+        model = YOLO(_OMNIPARSER_WEIGHTS)
+
+        evidence: list[tuple[int, float]] = []
+        for onset, before_idx, after_idx in pairs:
+            before_bgr = frames.get(before_idx)
+            after_bgr  = frames.get(after_idx)
+            if before_bgr is None or after_bgr is None:
+                continue
+
+            h, w = before_bgr.shape[:2]
+
+            # Full-screen transition → pixel diff degenerates → whole frame
+            # becomes the single ROI. OmniParser STILL verifies semantically
+            # (no blind acceptance: scrolls / video playback are rejected
+            # because their elements match between frames).
+            if phash_dists[onset] >= _PHASH_FULLFRAME_THRESHOLD:
+                regions = [(0, 0, w, h)]
+            else:
+                regions = GUIActionBoundaryExtractor._diff_regions(before_bgr, after_bgr)
+                if not regions:
+                    continue
+
+            best = 0.0
+            for roi in regions:
+                x1, y1, x2, y2 = roi
+                before_elems = GUIActionBoundaryExtractor._detect_elements(
+                    model, before_bgr, roi
+                )
+                after_elems = GUIActionBoundaryExtractor._detect_elements(
+                    model, after_bgr, roi
+                )
+                new_frac = GUIActionBoundaryExtractor._new_element_fraction(
+                    before_elems, after_elems
+                )
+                mod_frac = GUIActionBoundaryExtractor._modified_element_fraction(
+                    before_elems, after_elems,
+                    before_bgr[y1:y2, x1:x2], after_bgr[y1:y2, x1:x2],
+                )
+                best = max(best, new_frac, mod_frac)
+                if best >= 1.0:
+                    break
+
+            if best > 0.0:
+                evidence.append((onset, float(np.clip(best, 0.0, 1.0))))
+
+        # ── Phase 4: Gaussian-spread evidence (NO min-gap suppression here —
+        #    candidate merging is the dataset builder's job) ────────────────────
+        spread = int(_GUI_SPREAD_S * fps)
+        for frame_idx, score in evidence:
+            lo = max(0, frame_idx - spread)
+            hi = min(T_v, frame_idx + spread + 1)
+            offsets  = np.arange(lo, hi) - frame_idx
+            gaussian = np.exp(-0.5 * (offsets / max(spread / 2, 1)) ** 2)
+            features[lo:hi, 1] = np.maximum(
+                features[lo:hi, 1], (score * gaussian).astype(np.float32)
+            )
+
+        # Column 2: backward-compat display flag only.
+        features[:, 2] = (features[:, 1] >= _GUI_BOUNDARY_THRESHOLD).astype(np.float32)
+        return features
 
 
 class TranscriptionExtractor:
@@ -517,7 +480,9 @@ class TranscriptionExtractor:
     The whisper import is deferred, so the model is only loaded when needed.
     """
 
-    _MODEL_SIZE = "base"
+    # "base" missed German instructional vocabulary in pilot recordings;
+    # "small" is the best quality/latency trade-off for offline extraction.
+    _MODEL_SIZE = "small"
 
     @staticmethod
     def extract_transcript(recording_session: RecordingSession) -> Tuple[str, List[dict]]:
@@ -530,13 +495,13 @@ class TranscriptionExtractor:
             word dicts, each containing "word", "start", and "end" keys
             (times in seconds).  Returns ("", []) when no speech is detected.
         """
-
         import whisper  # deferred — only load when transcription is requested
 
         model = whisper.load_model(TranscriptionExtractor._MODEL_SIZE)
         result = model.transcribe(
             str(recording_session.recording_path),
             verbose=False,
+            language="de",
             word_timestamps=True,
             condition_on_previous_text=False,
         )
@@ -555,15 +520,12 @@ class SentenceSegmenter:
     """
     Segments a German transcript into sentences with timestamps using spaCy.
 
-    Replaces the former VerbChangeDetector. Verb-level analysis and ellipsis
-    detection have been removed — sentence-type classification is now handled
-    entirely by the NLI classifier in SemanticAudioFeatureExtractor, following
-    the taxonomy of Vander Linden (1995) and Safa et al. (2026):
-
-      ACTION      → user is instructed to perform an action  → boundary
-      RESULT      → software reacts / state change described → no boundary
-      PRECONDITION→ prerequisite stated                      → no boundary
-      BACKGROUND  → context or explanation given             → no boundary
+    NOTE: The former hard "es"-subject filter (dropping suspected system-
+    reaction sentences BEFORE classification) has been removed. Sentence-
+    type discrimination is the NLI classifier's job — a hard syntactic
+    pre-filter deleted evidence the classifier (and later the Random
+    Forest) never got to see, and misfired on sentences like
+    "Es öffnet sich das Menü, klicken Sie dann auf ...".
 
     Uses de_core_news_lg for sentence boundary detection; falls back to
     de_core_news_md or de_core_news_sm when lg is not installed.
@@ -606,15 +568,19 @@ class SentenceSegmenter:
 
         doc = nlp(full_text)
 
-        # Build char-offset → timestamp lookup from Whisper word list.
+        # Build char-offset → timestamp lookup from the Whisper word list.
+        # Cursor advances PAST each match so repeated words ("klicken ...
+        # klicken") map to their own occurrence instead of the first one.
         char_to_time: List[Tuple[int, float]] = []
         char_cursor = 0
         for w in words:
             surface = w.get("word", "").strip()
+            if not surface:
+                continue
             pos = full_text.find(surface, char_cursor)
             if pos != -1:
                 char_to_time.append((pos, float(w.get("start", 0.0))))
-                char_cursor = pos
+                char_cursor = pos + len(surface)
 
         def _resolve_time(char_idx: int) -> float:
             if not char_to_time:
@@ -632,34 +598,12 @@ class SentenceSegmenter:
             text = sent.text.strip()
             if not text:
                 continue
-            # Expletiv-"es"-Filter: Sätze wie "Es öffnet sich..." oder
-            # "Es erscheint ein Menü" sind Systemreaktionen — keine Nutzer-Aktion.
-            # Erkennbar daran dass das erste inhaltliche Subjekt ein Expletiv-"es"
-            # (dep_="sb" oder "nsubj") mit Lemma "es" ist.
-            # Diese Sätze werden vor dem NLI-Aufruf ausgeschlossen.
-            is_system_reaction = any(
-                token.lemma_.lower() == "es"
-                and token.dep_ in ("sb", "nsubj", "nsubjpass", "ep")
-                for token in sent
-            )
-            if is_system_reaction:
-                continue
             t_s = _resolve_time(sent.start_char)
             sentences.append((t_s * 1000.0, text))
 
         return sentences
 
 
-# ── NLI configuration ─────────────────────────────────────────────────────────
-
-# NLI hypothesis template — definiert die semantische Frage die das Modell
-# für jeden Satz beantwortet. Das Modell prüft ob der Satz die Hypothese
-# impliziert (Entailment). Der Platzhalter {} wird durch das candidate_label
-# ersetzt, sodass die vollständige Hypothese lautet:
-#   "Dieser Satz ist eine direkte Handlungsanweisung an einen menschlichen
-#    Benutzer, eine Aktion in der Software auszuführen."
-# Systemreaktionen ("Ein Fenster öffnet sich"), Ergebnisse und Kontext
-# implizieren diese Hypothese nicht → niedriger Entailment-Score.
 _NLI_HYPOTHESIS_TEMPLATE = (
     "Dieser Satz ist eine direkte Handlungsanweisung an einen menschlichen "
     "Benutzer, eine Aktion in der Software auszuführen: {}."
@@ -667,36 +611,34 @@ _NLI_HYPOTHESIS_TEMPLATE = (
 _NLI_CANDIDATE_LABELS = ["wahr", "falsch"]
 _ACTION_LABEL = "wahr"
 
-# Minimum NLI confidence score for a sentence to be accepted as ACTION.
-_NLI_THRESHOLD = 0.65
-
-# Minimum gap (seconds) between two boundary candidates to avoid duplicates.
-_MIN_BOUNDARY_GAP_S = 2.0
+# Backward-compat display threshold for column 2 ONLY. The graded NLI score
+# in column 1 is what downstream code (dataset builder, Random Forest)
+# consumes — no evidence is deleted below this value anymore.
+_NLI_THRESHOLD = 0.80
 
 
 class SemanticAudioFeatureExtractor:
     """
-    Extracts semantic boundary features from the audio transcript of a
-    RecordingSession using a four-class NLI sentence-type classifier.
+    Extracts graded semantic boundary evidence from the audio transcript of
+    a RecordingSession using a zero-shot NLI classifier.
 
-    Sentence-type taxonomy (Vander Linden 1995; Safa et al. 2026):
-      ACTION      → user is instructed to perform an action  → boundary
-      RESULT      → software reacts / state change described → no boundary
-      PRECONDITION→ prerequisite stated                      → no boundary
-      BACKGROUND  → context or explanation given             → no boundary
+    CHANGES vs. previous version (interfaces unchanged):
+      - EVERY sentence gets its P(ACTION) written as graded evidence —
+        the hard threshold and min-gap suppression no longer delete
+        evidence before the Random Forest sees it.
+      - The "sentence 0 is always a boundary" prior has been removed: it
+        injected a label-independent decision that would have leaked into
+        the audio modality's measured contribution.
+      - NLI calls are batched (one pipeline call for all sentences).
 
-    Pipeline:
-      1. SentenceSegmenter  — splits transcript into (t_ms, sentence) pairs
-      2. mDeBERTa Zero-Shot — classifies each sentence into the four types
-      3. Frame alignment    — writes ACTION scores as Gaussian into (T, 3) array
-
-    Output columns (aligned to AudioFeatureExtractor frame grid):
-      Col 0 — sentence_boundary:  1.0 at frames where any sentence starts
-      Col 1 — action_score:       Gaussian-weighted NLI score for ACTION sentences
-      Col 2 — action_flag:        Hard 0/1 threshold of col 1 at _NLI_THRESHOLD
+    Output columns (shape and meaning unchanged):
+      Col 0 — sentence_boundary: 1.0 at frames where any sentence starts
+      Col 1 — action_score:      graded P(ACTION) as Gaussian evidence
+      Col 2 — action_flag:       hard 0/1 at _NLI_THRESHOLD (display only)
     """
 
     _NLI_SPREAD_S = 1.5
+    _NLI_MODEL = "MoritzLaurer/mDeBERTa-v3-base-xnli-multilingual-nli-2mil7"
 
     @staticmethod
     def extract_semantic_features(
@@ -710,7 +652,7 @@ class SemanticAudioFeatureExtractor:
 
         :param full_text: Full transcript string from TranscriptionExtractor.
         :param words: Word-level Whisper dicts with "word", "start", "end".
-        :param n_frames: Number of audio frames (must match AudioFeatureExtractor output).
+        :param n_frames: Number of frames (must match VideoFeatureExtractor output).
         :param sampling_rate: Audio sampling rate returned by librosa.load.
         :return: np.ndarray of shape (n_frames, 3), dtype float32.
         """
@@ -721,70 +663,69 @@ class SemanticAudioFeatureExtractor:
 
         frames_per_second = sampling_rate / _HOP_LENGTH
 
-        # ── Step 1: Sentence segmentation ─────────────────────────────────────
+        # ── Step 1: sentence segmentation ─────────────────────────────────────
         sentences = SentenceSegmenter.segment(full_text, words)
         if not sentences:
             return features
 
-        # ── Step 2: Mark all sentence-start frames (column 0) ─────────────────
+        # ── Step 2: mark all sentence-start frames (column 0) ─────────────────
         for t_ms, _ in sentences:
             frame_idx = int(round((t_ms / 1000.0) * frames_per_second))
             if 0 <= frame_idx < n_frames:
                 features[frame_idx, 0] = 1.0
 
-        # ── Step 3: NLI sentence-type classification ───────────────────────────
+        # ── Step 3: batched NLI — graded P(ACTION) for EVERY sentence ─────────
         from transformers import pipeline  # deferred
 
         zero_shot = pipeline(
             "zero-shot-classification",
-            model="MoritzLaurer/mDeBERTa-v3-base-xnli-multilingual-nli-2mil7",
+            model=SemanticAudioFeatureExtractor._NLI_MODEL,
         )
+        texts = [text for _, text in sentences]
+        results = zero_shot(
+            texts,
+            candidate_labels=_NLI_CANDIDATE_LABELS,
+            hypothesis_template=_NLI_HYPOTHESIS_TEMPLATE,
+        )
+        if isinstance(results, dict):  # single-sentence transcripts
+            results = [results]
 
-        # Sentence 0 is always an ACTION boundary (start of first instruction).
-        first_t_s = sentences[0][0] / 1000.0
-        boundary_candidates: List[Tuple[float, float]] = [(first_t_s, 1.0)]
-        last_boundary_t_s = first_t_s
+        boundary_evidence: List[Tuple[float, float]] = []
+        for (t_ms, _), result in zip(sentences, results):
+            # P(ACTION) regardless of label ranking — graded, not thresholded.
+            idx = result["labels"].index(_ACTION_LABEL)
+            p_action = float(result["scores"][idx])
+            boundary_evidence.append((t_ms / 1000.0, p_action))
 
-        for t_ms, sentence_text in sentences[1:]:
-            t_s = t_ms / 1000.0
+        # ── Step 4: write graded scores as asymmetric Gaussians ───────────────
+        # Wide spread before the boundary (uncertain when the action starts),
+        # narrow after (avoid bleeding into the following RESULT sentence).
+        spread_before = int(SemanticAudioFeatureExtractor._NLI_SPREAD_S * frames_per_second)
+        spread_after  = int(SemanticAudioFeatureExtractor._NLI_SPREAD_S * 0.3 * frames_per_second)
 
-            result = zero_shot(
-                sentence_text,
-                candidate_labels=_NLI_CANDIDATE_LABELS,
-                hypothesis_template=_NLI_HYPOTHESIS_TEMPLATE,
-            )
-            top_label = result["labels"][0]
-            score = float(result["scores"][0])
-
-            # Only ACTION sentences trigger boundaries.
-            if top_label != _ACTION_LABEL or score < _NLI_THRESHOLD:
-                continue
-
-            # Enforce minimum gap — keep higher-confidence candidate on collision.
-            if t_s - last_boundary_t_s < _MIN_BOUNDARY_GAP_S:
-                if score > boundary_candidates[-1][1]:
-                    boundary_candidates[-1] = (t_s, score)
-                continue
-
-            boundary_candidates.append((t_s, score))
-            last_boundary_t_s = t_s
-
-        # ── Step 4: Write ACTION scores into frame arrays (columns 1 & 2) ──────
-        spread_frames = int(SemanticAudioFeatureExtractor._NLI_SPREAD_S * frames_per_second)
-
-        for t_s, score in boundary_candidates:
+        for t_s, score in boundary_evidence:
             center = int(round(t_s * frames_per_second))
-            lo = max(0, center - spread_frames)
-            hi = min(n_frames, center + spread_frames + 1)
 
-            offsets = np.arange(lo, hi) - center
-            gaussian = np.exp(-0.5 * (offsets / max(spread_frames / 2, 1)) ** 2)
-
-            features[lo:hi, 1] = np.maximum(
-                features[lo:hi, 1], (score * gaussian).astype(np.float32)
+            lo = max(0, center - spread_before)
+            offsets_l = np.arange(lo, center) - center
+            sigma_l = max(spread_before / 2, 1)
+            gaussian_l = np.exp(-0.5 * (offsets_l / sigma_l) ** 2)
+            features[lo:center, 1] = np.maximum(
+                features[lo:center, 1], (score * gaussian_l).astype(np.float32)
             )
 
-        # Column 2: hard flag wherever column 1 exceeds threshold.
+            if 0 <= center < n_frames:
+                features[center, 1] = max(features[center, 1], np.float32(score))
+
+            hi = min(n_frames, center + spread_after + 1)
+            offsets_r = np.arange(center + 1, hi) - center
+            sigma_r = max(spread_after / 2, 1)
+            gaussian_r = np.exp(-0.5 * (offsets_r / sigma_r) ** 2)
+            features[center + 1:hi, 1] = np.maximum(
+                features[center + 1:hi, 1], (score * gaussian_r).astype(np.float32)
+            )
+
+        # Column 2: backward-compat display flag only.
         features[:, 2] = (features[:, 1] >= _NLI_THRESHOLD).astype(np.float32)
 
         return features
@@ -796,14 +737,46 @@ _EVENT_WINDOW_S = 0.25
 # Maximum size for the events
 _MAX_EVENT_RECENCY_S = 5.0
 
+# Idle gap after which the NEXT event is considered a step-onset candidate.
+_EVENT_IDLE_FULL_S = 3.0     # gap ≥ 3 s → idle component saturates at 1.0
+
+# Gaussian spread for event boundary evidence (matches GUI spread so all
+# modalities emit comparable evidence shapes).
+_EVENT_SPREAD_S = 1.0
+
+# Backward-compat display threshold for the event evidence flag column.
+_EVENT_BOUNDARY_THRESHOLD = 0.5
+
+# Weighting of the two evidence components.
+_EVENT_IDLE_WEIGHT = 0.7
+_EVENT_TYPE_CHANGE_WEIGHT = 0.3
+
 
 class EventFeatureExtractor:
     """
     Provides event feature extraction.
+
+    extract_event_features (UNCHANGED interface & semantics) returns the
+    descriptive per-frame features (count, recency, type flags).
+
+    extract_event_boundary_evidence (NEW, additive) turns the raw event
+    stream into a boundary HYPOTHESIS in the same (n_frames, 3) evidence
+    format as GUI and semantic audio — the missing piece that lets the
+    events modality participate in candidate generation on equal footing:
+      - idle-gap onset: first event after a pause (a new step begins)
+      - input-type transition: keyboard → mouse or vice versa
     """
 
     # Event types that are considered for the event feature extraction.
     _MARKER_EVENT_TYPES = {"mouse_click", "key_press", "key_release", "mouse_scroll"}
+
+    # Coarse input categories for transition detection.
+    _TYPE_CATEGORY = {
+        "mouse_click":  "mouse",
+        "mouse_scroll": "scroll",
+        "key_press":    "keyboard",
+        "key_release":  "keyboard",
+    }
 
     @staticmethod
     def extract_event_markers(recording_session: RecordingSession) -> List[Tuple[float, str]]:
@@ -812,7 +785,6 @@ class EventFeatureExtractor:
         :param recording_session: The recording session contains the path to events.json.
         :return: A list of tuples (t_ms, type) where t_ms is the timestamp of the event
         """
-
         events = EventFeatureExtractor._read_events(recording_session.events_path)
 
         markers = [
@@ -835,14 +807,12 @@ class EventFeatureExtractor:
         :param frame_times_ms: The frame times in milliseconds.
         :return: A vector of event features.
         """
-
         markers = EventFeatureExtractor.extract_event_markers(recording_session)
         n_frames = len(frame_times_ms)
         features = np.zeros((n_frames, 5), dtype=np.float32)
 
         if not markers:
             features[:, 1] = _MAX_EVENT_RECENCY_S
-
             return features
 
         marker_times_s = np.array([t_ms / 1000.0 for t_ms, _ in markers], dtype=np.float64)
@@ -867,13 +837,83 @@ class EventFeatureExtractor:
         return features
 
     @staticmethod
+    def extract_event_boundary_evidence(
+        recording_session: RecordingSession,
+        frame_times_ms: np.ndarray,
+    ) -> np.ndarray:
+        """
+        NEW (additive): boundary evidence from the event stream, in the
+        same (n_frames, 3) format as the GUI and semantic extractors.
+
+        Evidence model per event e_i with preceding gap g_i:
+          idle_component  = min(g_i / _EVENT_IDLE_FULL_S, 1)   in [0, 1]
+          type_component  = 1 if input category changed vs. previous event
+          score(e_i)      = 0.7 * idle_component + 0.3 * type_component
+
+        The very first event of a session gets idle_component = 1.0
+        (the workflow's first step necessarily begins there).
+
+        Output columns:
+          Col 0 — onset_flag:      1.0 at frames containing a scored event
+          Col 1 — boundary_score:  graded evidence [0, 1], Gaussian spread
+          Col 2 — boundary_flag:   hard 0/1 at threshold (display only)
+        """
+        markers = EventFeatureExtractor.extract_event_markers(recording_session)
+        n_frames = len(frame_times_ms)
+        features = np.zeros((n_frames, 3), dtype=np.float32)
+        if not markers or n_frames == 0:
+            return features
+
+        frame_times_s = np.asarray(frame_times_ms, dtype=np.float64) / 1000.0
+        duration_s = float(frame_times_s[-1] - frame_times_s[0])
+        fps = (n_frames - 1) / duration_s if duration_s > 0 else 1.0
+        spread = max(1, int(_EVENT_SPREAD_S * fps))
+
+        prev_t_s: float | None = None
+        prev_cat: str | None = None
+
+        for t_ms, ev_type in markers:
+            t_s = t_ms / 1000.0
+            cat = EventFeatureExtractor._TYPE_CATEGORY.get(ev_type, "other")
+
+            if prev_t_s is None:
+                idle_component = 1.0
+                type_component = 0.0
+            else:
+                gap = t_s - prev_t_s
+                idle_component = min(gap / _EVENT_IDLE_FULL_S, 1.0)
+                type_component = 1.0 if cat != prev_cat else 0.0
+
+            score = (
+                _EVENT_IDLE_WEIGHT * idle_component
+                + _EVENT_TYPE_CHANGE_WEIGHT * type_component
+            )
+
+            center = int(np.searchsorted(frame_times_s, t_s))
+            center = min(max(center, 0), n_frames - 1)
+            features[center, 0] = 1.0
+
+            lo = max(0, center - spread)
+            hi = min(n_frames, center + spread + 1)
+            offsets = np.arange(lo, hi) - center
+            gaussian = np.exp(-0.5 * (offsets / max(spread / 2, 1)) ** 2)
+            features[lo:hi, 1] = np.maximum(
+                features[lo:hi, 1], (score * gaussian).astype(np.float32)
+            )
+
+            prev_t_s = t_s
+            prev_cat = cat
+
+        features[:, 2] = (features[:, 1] >= _EVENT_BOUNDARY_THRESHOLD).astype(np.float32)
+        return features
+
+    @staticmethod
     def _read_events(events_path: Path) -> List[dict]:
         """
         Read the events.json file
         :param events_path: The path to the file
         :return: A list of events
         """
-
         try:
             with events_path.open(encoding="utf-8") as fh:
                 data = json.load(fh)

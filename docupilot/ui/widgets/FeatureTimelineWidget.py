@@ -59,6 +59,28 @@ class FeatureTimelineWidget(QWidget):
         self._duration_ms = duration_ms
         self.update()
 
+    def set_duration(self, duration_ms: float) -> None:
+        """
+        Update the total recording duration without touching loaded tracks,
+        boundaries, or events.
+
+        Wird benötigt, weil die tatsächliche Dauer manchmal erst NACH
+        set_data()/set_boundaries()/set_events() bekannt wird (z. B. wenn
+        der Media-Player die Dauer noch nicht ermittelt hatte, als der
+        Dialog aufgebaut wurde). Ohne diese Methode bliebe self._duration_ms
+        dauerhaft auf dem ursprünglichen — möglicherweise 0 — Wert stehen,
+        und JEDE Marker-Zeichnung (Grenzen, Events, Cursor, Semantik-Marker)
+        ist an "self._duration_ms > 0" gekoppelt und würde für immer
+        unsichtbar bleiben.
+
+        :param duration_ms: Die aktuelle, korrekte Gesamtdauer in Millisekunden.
+        :return: None
+        """
+        if duration_ms == self._duration_ms:
+            return
+        self._duration_ms = duration_ms
+        self.update()
+
     def set_cursor(self, pos_ms: float) -> None:
         """
         Move the playback cursor line.

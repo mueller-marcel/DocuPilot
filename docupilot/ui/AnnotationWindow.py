@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import json
-from datetime import datetime, timezone
 from pathlib import Path
 
 from PySide6.QtCore import QTimer, QUrl, Qt, Signal
@@ -202,6 +201,13 @@ class AnnotationWindow(QWidget):
     Annotation page shown after a recording has been stopped. Orchestrates
     the player, toolbar, and bottom bar, and delegates to EventsPanelWidget
     and FeatureDialog rather than building either itself.
+
+    Ground-Truth-Grenzen werden NICHT mehr lokal gehalten — sie leben
+    ausschließlich in session.ground_truth_data. AnnotationWindow liest und
+    schreibt sie über die dafür vorgesehenen RecordingSession-Methoden
+    (load_ground_truth, add_ground_truth_boundary, set_ground_truth_boundaries).
+    Dadurch verhält sich eine frisch aufgezeichnete Session exakt so wie eine
+    über "Datei > Öffnen" geladene: beide teilen sich dieselbe Quelle.
     """
 
     back_requested = Signal()
@@ -217,8 +223,6 @@ class AnnotationWindow(QWidget):
 
         self._session: RecordingSession | None = None
         self._events: list[dict] = []
-        self._boundaries: list[dict] = []
-        self._boundary_path: Path | None = None
         self._duration_ms: float = 0.0
         self._feature_dialog: FeatureDialog | None = None
 
@@ -240,13 +244,19 @@ class AnnotationWindow(QWidget):
         """
         Load a recording session into the player and event panel.
 
+        Lädt zusätzlich vorhandene Ground-Truth-Grenzen aus
+        session.ground_truth.json nach, damit bereits gesetzte Grenzen auch
+        nach einem erneuten Öffnen der Session sichtbar sind — unabhängig
+        davon, ob die Session gerade erst aufgenommen oder von der Platte
+        geöffnet wurde.
+
         :param session: The recording session.
         :return: None
         """
         self._session = session
-        self._boundaries = []
-        self._boundary_path = session.session_dir / "ground_truth.json"
         self._duration_ms = 0.0
+
+        session.load_ground_truth()
 
         self._events = self._read_events(session.events_path)
         self._events_panel.set_events(self._events)
@@ -569,18 +579,20 @@ class AnnotationWindow(QWidget):
         """
         Record a boundary at the current playback position.
 
+        Delegiert das Anlegen und Speichern vollständig an
+        session.add_ground_truth_boundary(), damit es nur EINE Stelle im
+        Code gibt, die das Schema einer Grenze und die Persistenz kennt.
+        Als Label wird der formatierte Zeitstempel verwendet, damit die
+        Marker in der FeatureDialog-Timeline sofort identifizierbar sind.
+
         :return: None
         """
-        pos_ms = float(self._player.position())
-        self._boundaries.append(
-            {
-                "type": "boundary",
-                "t_ms": pos_ms,
-                "created_at_utc": datetime.now(timezone.utc).isoformat(),
-            }
-        )
+        if self._session is None:
+            return
 
-        self._write_boundaries()
+        pos_ms = float(self._player.position())
+        self._session.add_ground_truth_boundary(pos_ms, label=format_ms(pos_ms))
+
         self._update_boundary_count()
         self._flash_boundary_button()
 
@@ -590,30 +602,24 @@ class AnnotationWindow(QWidget):
 
         :return: None
         """
-        dlg = _BoundaryDialog(self._boundaries, parent=self)
-        dlg.exec()
-        self._boundaries = dlg.get_boundaries()
-        self._write_boundaries()
-        self._update_boundary_count()
-
-    def _write_boundaries(self) -> None:
-        """
-        Persist the current boundaries to the ground-truth JSON file.
-
-        :return: None
-        """
-        if self._boundary_path is None:
+        if self._session is None:
             return
-        with self._boundary_path.open("w", encoding="utf-8") as fh:
-            json.dump(self._boundaries, fh, ensure_ascii=False, indent=2)
+
+        dlg = _BoundaryDialog(self._session.ground_truth_data, parent=self)
+        dlg.exec()
+        self._session.set_ground_truth_boundaries(dlg.get_boundaries())
+        self._update_boundary_count()
 
     def _update_boundary_count(self) -> None:
         """
-        Refresh the boundary count label.
+        Refresh the boundary count label from session.ground_truth_data.
 
         :return: None
         """
-        boundary_count = len(self._boundaries)
+        if self._session is None:
+            return
+
+        boundary_count = len(self._session.ground_truth_data)
         self._boundary_count_label.setText(f"{boundary_count} Grenze{'n' if boundary_count != 1 else ''} gesetzt")
 
     def _flash_boundary_button(self) -> None:
@@ -646,6 +652,10 @@ class AnnotationWindow(QWidget):
         """
         Open (or re-focus) the feature visualizer dialog.
 
+        boundaries wird nicht mehr übergeben: FeatureDialog liest die
+        Ground-Truth-Grenzen direkt aus session.ground_truth_data, damit es
+        keine zweite Kopie mehr geben kann, die von der ersten abweicht.
+
         :return: None
         """
         if self._session is None:
@@ -663,7 +673,6 @@ class AnnotationWindow(QWidget):
             player=self._player,
             session=self._session,
             duration_ms=self._duration_ms,
-            boundaries=self._boundaries,
             event_markers=event_markers,
             parent=self,
         )
