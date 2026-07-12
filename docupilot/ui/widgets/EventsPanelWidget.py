@@ -10,29 +10,46 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from docupilot.ui.event_formatting import DEFAULT_DOT_COLOR, DOT_COLOR, PROMINENT_TYPES, format_ms
+
+def format_ms(ms: float) -> str:
+    s = int(ms) // 1000
+    return f"{s // 60:02d}:{s % 60:02d}.{int(ms) % 1000:03d}"
+
+
+_PROMINENT_TYPES = {
+    "av_started", "av_stopped",
+    "input_started", "input_stopped",
+    "recording_started", "recording_stopping", "recording_stopped",
+    "mouse_click", "key_press", "key_release", "mouse_scroll",
+}
+
+_DOT_COLOR: dict[str, str] = {
+    "av_started":         "#534AB7",
+    "av_stopped":         "#534AB7",
+    "input_started":      "#1D9E75",
+    "input_stopped":      "#1D9E75",
+    "recording_started":  "#e24b4a",
+    "recording_stopping": "#e24b4a",
+    "recording_stopped":  "#e24b4a",
+    "mouse_click":        "#D85A30",
+    "mouse_scroll":       "#D85A30",
+    "mouse_move":         "#aaaaaa",
+    "key_press":          "#BA7517",
+    "key_release":        "#BA7517",
+}
+
+_DEFAULT_DOT_COLOR = "#aaaaaa"
 
 
 class _EventRow(QWidget):
-    """
-    A single row in EventsPanelWidget, representing one event.
-    """
-
     jumped = Signal(float)
 
     def __init__(self, ev: dict, parent: QWidget | None = None) -> None:
-        """
-        Initialize the event row widget.
-
-        :param ev: The event data.
-        :param parent: The parent widget.
-        :return: None
-        """
         super().__init__(parent)
 
         self.event_data = ev
         self._active = False
-        self._prominent = ev.get("type") in PROMINENT_TYPES
+        self._prominent = ev.get("type") in _PROMINENT_TYPES
 
         self.setCursor(Qt.CursorShape.PointingHandCursor)
         self.setToolTip(f"Springe zu {format_ms(ev.get('t_ms', 0.0))}")
@@ -41,7 +58,7 @@ class _EventRow(QWidget):
         layout.setContentsMargins(8, 3, 8, 3)
         layout.setSpacing(6)
 
-        color = DOT_COLOR.get(ev.get("type", ""), DEFAULT_DOT_COLOR)
+        color = _DOT_COLOR.get(ev.get("type", ""), _DEFAULT_DOT_COLOR)
         dot = QLabel()
         dot.setFixedSize(8, 8)
         dot.setStyleSheet(f"background:{color}; border-radius:4px;")
@@ -62,7 +79,7 @@ class _EventRow(QWidget):
                 detail = f"{ev.get('button', '').replace('Button.', '')}{action}"
             elif t in ("key_press", "key_release"):
                 detail = str(ev.get("key", ""))
-            elif t in ("mouse_scroll",):
+            elif t == "mouse_scroll":
                 detail = f"({ev.get('x', '?')},{ev.get('y', '?')})"
             if detail:
                 detail_label = QLabel(detail)
@@ -78,36 +95,15 @@ class _EventRow(QWidget):
         self._update_style(active=False)
 
     def mousePressEvent(self, mouse_event) -> None:
-        """
-        Emit jumped with this row's timestamp.
-
-        :param mouse_event: The mouse press event.
-        :return: None
-        """
         self.jumped.emit(float(self.event_data.get("t_ms", 0.0)))
 
     def set_active(self, active: bool, past: bool) -> None:
-        """
-        Update the active/past state and restyle if changed.
-
-        :param active: Whether the row is currently active.
-        :param past: Whether the row's event lies in the past.
-        :return: None
-        """
         if self._active == active:
             return
-
         self._active = active
         self._update_style(active=active, past=past)
 
     def _update_style(self, *, active: bool, past: bool = False) -> None:
-        """
-        Apply the stylesheet matching the row's current state.
-
-        :param active: Whether the row is currently active.
-        :param past: Whether the row's event lies in the past.
-        :return: None
-        """
         if active:
             self.setStyleSheet(
                 "background:#dbeafe; border-radius:5px;border-left:3px solid #4da3ff;"
@@ -116,27 +112,17 @@ class _EventRow(QWidget):
             self.setStyleSheet("background:transparent; border:none; opacity:0.5;")
         else:
             self.setStyleSheet("background:transparent; border:none;")
-
         self.setProperty("active", active)
 
 
 class EventsPanelWidget(QWidget):
-    """
-    Self-contained event sidebar with header, scrollable event rows, and
-    live highlighting around the current playback position.
-    """
+    """Scrollbare Event-Sidebar mit Live-Highlighting der aktuellen Abspielposition."""
 
     jumped = Signal(float)
 
     TOLERANCE_MS: float = 250.0
 
     def __init__(self, parent: QWidget | None = None) -> None:
-        """
-        Initialize the events panel widget.
-
-        :param parent: The parent widget.
-        :return: None
-        """
         super().__init__(parent)
 
         self._events: list[dict] = []
@@ -172,12 +158,6 @@ class EventsPanelWidget(QWidget):
         layout.addWidget(self._scroll)
 
     def set_events(self, events: list[dict]) -> None:
-        """
-        Replace the displayed events and rebuild the row list.
-
-        :param events: The full list of raw event dicts for the session.
-        :return: None
-        """
         self._events = events
 
         for row in self._event_rows:
@@ -192,13 +172,6 @@ class EventsPanelWidget(QWidget):
             self._event_rows.append(row)
 
     def highlight(self, pos_ms: float) -> None:
-        """
-        Mark rows within TOLERANCE_MS as active, fade older rows, and
-        scroll the first active row into view.
-
-        :param pos_ms: The current playback position in milliseconds.
-        :return: None
-        """
         tol = self.TOLERANCE_MS
         first_active: _EventRow | None = None
 
