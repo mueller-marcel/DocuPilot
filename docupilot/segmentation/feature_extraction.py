@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from collections.abc import Callable
 from pathlib import Path
 
 import numpy as np
@@ -62,68 +63,122 @@ def _apply_gaussian(
 
 # ── GUI Action Boundary Extractor ─────────────────────────────────────────────
 #
-# Detects action-completion EVIDENCE from screen recordings using only the
-# video file. Both signals are derived purely from pixel data so the video
-# modality stays independent of audio and events for Shapley analysis.
+# Graded action-boundary evidence from the screen recording ALONE — no events,
+# no audio, so the video modality stays independent for the 2^3 Shapley ablation.
 #
-#   Signal 1 — CLIP semantic embeddings (primary):
-#     Frames are sampled at _CLIP_SAMPLE_FPS and embedded by a pretrained
-#     CLIP vision encoder. Cosine distance between consecutive embeddings
-#     measures the semantic distance between UI states: high distance means
-#     the UI transitioned to a meaningfully different state, which is the
-#     visual signature of a completed action. This catches dialog opens/
-#     closes, form submissions showing a result page, panel replacements,
-#     and navigation — any change that is semantically significant — while
-#     ignoring cosmetic cursor movement and animation noise that confuse
-#     pixel-diff and even pHash approaches.
+# ACTION (thesis definition):
+#   user-triggered, and it moves the system into a NEW, PERSISTENT state. The
+#   boundary marks the COMPLETION: the screen settles into the resulting state.
 #
-#   Signal 2 — Multi-scale pHash (secondary):
-#     Three perceptual hashes per frame (full, left-half, right-half) detect
-#     structural layout changes at full video frame rate. This bridges the
-#     temporal gaps between CLIP samples and contributes where CLIP misses
-#     fast visual events (tooltip flashes, highlight state changes).
+# The structure answers exactly ONE question — "where does the screen stand
+# still?" — and the VLM answers every other:
 #
-# DESIGN PRINCIPLE (unchanged):
-#   Both signals emit graded evidence in [0, 1]. No boundary decision is
-#   made here. Thresholding and peak picking happen once, downstream, in
-#   dataset_builder — identically for every modality (Shapley prerequisite).
+#   1. Activity signal.  pHash on an 8x8 TILE grid; activity = the largest
+#      per-tile change. The grid is not a refinement, it is the difference
+#      between seeing the actions and not seeing them. Measured on session_07
+#      (Excel, 2560x1440, 8 annotated actions), peak activity per action:
 #
-# Output columns (shape and semantics unchanged):
-#   Col 0 — onset_flag:         1.0 at detected transition frames
-#   Col 1 — gui_boundary_score: graded evidence [0, 1], Gaussian spread
-#   Col 2 — gui_boundary_flag:  hard 0/1 at threshold (display only;
-#                                dataset_builder uses col 1, not col 2)
+#                              full+halves   8x8 grid
+#        Autofilter aktiviert      0.000       0.125    <- invisible before
+#        Bereich kopiert           0.031       0.344    <- invisible before
+#        Sortiert                  0.125       0.500
+#        Filter angewandt          0.156       0.469
+#
+#      On a 2560x1440 screen the table covers ~7% of the pixels, and a
+#      whole-frame pHash (a 32x32 DCT) averages a row of filter arrows away
+#      completely. Max over tiles, never mean: an action changes ONE region, and
+#      a mean would divide it by the 63 tiles where nothing happened.
+#
+#   2. Dwells.  Maximal runs of still frames are the settled states the UI rests
+#      in — GIFdroid's "steady state" (Feng et al., ICSE 2022), the cut points
+#      of SeeAction (arXiv:2503.12873). Parameters swept against session_07's
+#      eight actions; see _ACTIVITY_QUIET.
+#
+#   3. Anchored VLM state tracking.  An ANCHOR holds the last ESTABLISHED state.
+#      Every following dwell is compared BY THE MODEL against that anchor — not
+#      against its immediate predecessor, because "new state" is meaningless
+#      except relative to the last state the user actually established:
+#
+#        anchor := first dwell
+#        for each following dwell d:
+#            p := P(ACTION_COMPLETED | anchor, d)        <- the VLM
+#            write p as graded evidence at d's settle frame
+#            if p >= _ANCHOR_ADVANCE:  anchor := d       <- a new state is set
+#
+#      Opening the File menu is rejected AND leaves the anchor at the pre-menu
+#      state, so the action that follows is judged against the state the user
+#      started from. That is what makes the menu case fall out by itself.
+#
+# DELIBERATELY ABSENT — do not reintroduce:
+#   - Any magnitude score. Integrated burst activity measures HOW MUCH the screen
+#     changed, which is not the question: it rated a window activating above a
+#     cell being reformatted, and a dropdown above the filter it applies.
+#   - Non-maximum suppression. "Within N seconds the higher score wins" is a
+#     structural rule that can delete a real boundary behind a mis-scored menu.
+#     The anchor makes it unnecessary: a second boundary must beat the state the
+#     first one established.
+#   - A structural fallback. Without the VLM this extractor has nothing to say,
+#     and a lane full of magnitude peaks reads as evidence when it is noise. It
+#     raises instead.
+#
+# Output (T_v, 3), unchanged for dataset_builder and FeatureDialog:
+#   col 0 — onset_flag:  1.0 at each judged settle frame
+#   col 1 — score:       graded P(action) in [0, 1], Gaussian-spread
+#   col 2 — flag:        0/1 at threshold (DISPLAY ONLY; dataset_builder uses
+#                        col 1 — thresholding happens once, downstream, for every
+#                        modality alike, which is the Shapley prerequisite)
 
-_CLIP_MODEL_NAME     = "openai/clip-vit-base-patch32"
-_CLIP_SAMPLE_FPS     = 1.0   # CLIP inference rate; 1 fps limits compute
-_CLIP_BATCH_SIZE     = 32    # frames per CLIP forward pass
-_CLIP_ONSET_THRESH   = 0.03  # cosine distance [0, 2] to register an onset
-_CLIP_SATURATE       = 0.20  # distance at which evidence reaches cap
-_CLIP_EVIDENCE_CAP   = 0.90  # primary signal: high cap
+_PHASH_SIZE    = 8
+_ACTIVITY_GRID = 8
 
-_PHASH_SIZE          = 8
-_PHASH_ONSET_THRESH  = 0.08  # fraction of differing hash bits
-_PHASH_SATURATE      = 0.35
-_PHASH_EVIDENCE_CAP  = 0.50  # secondary signal: lower cap
-_PHASH_DEDUP_WIN_S   = 0.5   # burst de-dup: one animation = one onset
+# Swept on session_07 against its eight video-derived actions, keeping the
+# cheapest setting at FULL recall (every action proposed within the +-1 s
+# labeling tolerance of dataset_builder):
+#
+#   grid 2 (== the old full+halves signal): NO setting ever reaches 8/8
+#   grid 8, quiet 0.05, dwell 0.3 s: 65 proposals, 8/8
+#   grid 8, quiet 0.08, dwell 0.5 s: 41 proposals, 8/8   <- chosen
+#   grid 8, quiet 0.08, dwell 0.8 s: 37 proposals, 8/8
+#
+# Below ~37 proposals real actions start to be missed, and a missed action is
+# unrecoverable — the VLM never sees it. Recall here, precision in the VLM.
+_ACTIVITY_QUIET = 0.08   # per-tile pHash distance below which a frame is "still"
+_MIN_DWELL_S    = 0.5    # a still run this long is a settled state
 
-_GUI_SPREAD_S           = 1.0
-_GUI_BOUNDARY_THRESHOLD = 0.5
+# Settled frames are sampled this far INTO a dwell: the first still frame can
+# still show a fading animation the pHash no longer reads as motion.
+_SETTLE_OFFSET_S = 0.2
+
+# A tile counts as CHANGED (for the Set-of-Mark box only) when its mean absolute
+# grey-level difference exceeds this. One grey level out of 255: far above JPEG
+# noise, far below anything a human would call a change. Deliberately not tuned —
+# the box only has to point, not to decide.
+_PIXEL_CHANGE_EPS = 1.0
+
+# At or above this probability the system is taken to REST in a new established
+# state, and later dwells are compared against it. This selects the reference
+# frame; it is not a boundary decision — col 1 keeps the graded score either way.
+_ANCHOR_ADVANCE = 0.5
+
+_SPREAD_S       = 1.0
+_FLAG_THRESHOLD = 0.5
+
+# A pathological recording (constant flicker) could fragment into thousands of
+# dwells. Anchoring is sequential, so the budget is spent from the start.
+_MAX_CALLS = 400
 
 
 class GUIActionBoundaryExtractor:
     """
-    Extracts graded GUI action-completion evidence from screen recordings.
-    Uses only the video file — no events, no audio (Shapley independence).
+    Graded GUI action-boundary evidence, from the video file only.
 
-    Signal 1 (primary): CLIP semantic embeddings detect meaningful UI state
-    transitions that signal a completed action (high cosine distance).
-
-    Signal 2 (secondary): Multi-scale pHash detects structural layout
-    changes at full frame rate, bridging gaps between CLIP samples.
+    pHash tile activity -> dwell segmentation -> a local VLM judges each
+    (anchor, dwell) pair of settled states. Requires a reachable Ollama server;
+    there is no structural fallback, because measuring how much the screen
+    changed does not answer whether a new state was reached.
     """
 
-    # ── pHash helpers ─────────────────────────────────────────────────────────
+    # ── Activity signal ───────────────────────────────────────────────
 
     @staticmethod
     def _phash(gray: np.ndarray) -> object:
@@ -132,177 +187,274 @@ class GUIActionBoundaryExtractor:
         return imagehash.phash(Image.fromarray(gray), hash_size=_PHASH_SIZE)
 
     @staticmethod
-    def _phash_dist(a: object, b: object) -> float:
-        return float(a - b) / (_PHASH_SIZE ** 2)
+    def _tiles(gray: np.ndarray) -> tuple:
+        """One pHash per cell of the activity grid."""
+        h, w = gray.shape[:2]
+        g = _ACTIVITY_GRID
+        ph = GUIActionBoundaryExtractor._phash
+        return tuple(
+            ph(gray[r * h // g:(r + 1) * h // g, c * w // g:(c + 1) * w // g])
+            for r in range(g) for c in range(g)
+        )
 
     @staticmethod
-    def _max_phash_dist(a: tuple, b: tuple) -> float:
-        d = GUIActionBoundaryExtractor._phash_dist
-        return max(d(a[0], b[0]), d(a[1], b[1]), d(a[2], b[2]))
-
-    # ── pHash scan (full video, multi-scale) ──────────────────────────────────
+    def _distance(a: tuple, b: tuple) -> float:
+        """Largest per-tile pHash distance, normalised to [0, 1]."""
+        return max(float(x - y) for x, y in zip(a, b)) / (_PHASH_SIZE ** 2)
 
     @staticmethod
-    def _scan_phashes(video_path: str) -> tuple[list[tuple], int]:
+    def _changed_region(
+        before: np.ndarray, after: np.ndarray
+    ) -> tuple[float, float, float, float] | None:
         """
-        Stream all frames; store (full, left-half, right-half) pHash triples.
-        Memory: O(T) hash triples — no pixel data retained.
+        Bounding box (x0, y0, x1, y1 in [0,1]) of the tiles whose PIXELS differ.
+
+        This is the Set-of-Mark input (Yang et al., arXiv:2310.11441): the box is
+        drawn onto both halves of the composite so the model is told where to
+        look and stops inventing changes elsewhere.
+
+        Pixels, not pHash — and that is the whole point. A perceptual hash is a
+        DCT sign pattern, and on a low-texture tile (the empty half of a
+        spreadsheet) those coefficients sit near zero, so codec noise flips them:
+        measured on this dataset, tiles with almost no texture reported a pHash
+        distance of 0.34 while their pixels had moved by 0.08 of one grey level.
+        Roughly 7 % of tiles lie that way. A box built on the hash therefore
+        covered the whole screen on pairs that were visually identical — it
+        marked nothing.
+
+        The mean absolute grey-level difference has no such failure mode. It is
+        used ONLY here, to point the model at a region; the activity signal that
+        finds the settled states keeps using pHash, where its codec robustness is
+        what we want and the max-over-tiles noise is already absorbed by the
+        calibrated quiet threshold.
+
+        The box says WHERE something differs, never WHETHER it is an action — a
+        dropdown opening gets a box too. That judgement stays with the model.
+
+        :return: None when no tile differs measurably.
         """
         import cv2
+
+        g = _ACTIVITY_GRID
+        a = cv2.cvtColor(before, cv2.COLOR_BGR2GRAY).astype(np.int16)
+        b = cv2.cvtColor(after, cv2.COLOR_BGR2GRAY).astype(np.int16)
+        h, w = a.shape[:2]
+
+        changed = []
+        for r in range(g):
+            for c in range(g):
+                y0, y1 = r * h // g, (r + 1) * h // g
+                x0, x1 = c * w // g, (c + 1) * w // g
+                diff = float(np.abs(a[y0:y1, x0:x1] - b[y0:y1, x0:x1]).mean())
+                if diff > _PIXEL_CHANGE_EPS:
+                    changed.append((r, c))
+        if not changed:
+            return None
+
+        rows = [r for r, _ in changed]
+        cols = [c for _, c in changed]
+        return (
+            min(cols) / g,
+            min(rows) / g,
+            (max(cols) + 1) / g,
+            (max(rows) + 1) / g,
+        )
+
+    @staticmethod
+    def _scan(video_path: str) -> tuple[list[tuple], np.ndarray]:
+        """Stream the video once; return per-frame tile hashes and the activity."""
+        import cv2
+
         cap = cv2.VideoCapture(video_path)
         if not cap.isOpened():
-            return [], 0
+            return [], np.zeros(0, dtype=np.float32)
+
         hashes: list[tuple] = []
-        ph = GUIActionBoundaryExtractor._phash
         try:
             while True:
                 ret, bgr = cap.read()
                 if not ret:
                     break
                 gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
-                mid = gray.shape[1] // 2
-                hashes.append((ph(gray), ph(gray[:, :mid]), ph(gray[:, mid:])))
+                hashes.append(GUIActionBoundaryExtractor._tiles(gray))
         finally:
             cap.release()
-        return hashes, len(hashes)
 
-    # ── CLIP embedding extraction ──────────────────────────────────────────────
+        activity = np.zeros(len(hashes), dtype=np.float32)
+        for i in range(1, len(hashes)):
+            activity[i] = GUIActionBoundaryExtractor._distance(hashes[i - 1], hashes[i])
+        return hashes, activity
 
-    @staticmethod
-    def _clip_sample_indices(total_frames: int, video_fps: float) -> list[int]:
-        """Evenly spaced frame indices at _CLIP_SAMPLE_FPS."""
-        step = max(1, round(video_fps / _CLIP_SAMPLE_FPS))
-        return list(range(0, total_frames, step))
+    # ── Dwell segmentation ────────────────────────────────────────────
 
     @staticmethod
-    def _extract_clip_embeddings(video_path: str, indices: list[int]) -> np.ndarray:
+    def _dwells(activity: np.ndarray, min_frames: int) -> list[tuple[int, int]]:
+        """Maximal runs of still frames lasting at least min_frames, inclusive."""
+        out: list[tuple[int, int]] = []
+        i, n = 0, len(activity)
+        while i < n:
+            if activity[i] < _ACTIVITY_QUIET:
+                j = i
+                while j < n and activity[j] < _ACTIVITY_QUIET:
+                    j += 1
+                if j - i >= min_frames:
+                    out.append((i, j - 1))
+                i = j
+            else:
+                i += 1
+        return out
+
+    @staticmethod
+    def _read_frames(video_path: str, wanted: set[int]) -> dict[int, np.ndarray]:
         """
-        Extract L2-normalized CLIP image embeddings for the requested frames.
+        Fetch the given frames in one linear pass, already downscaled.
 
-        Streams the video in a single pass, collecting only the indexed
-        frames, then runs the CLIP vision encoder in batches.
+        Sequential decoding beats seeking: CAP_PROP_POS_FRAMES on a long-GOP MP4
+        re-decodes from the preceding keyframe every time, so dozens of seeks
+        cost more than reading the file straight through.
 
-        Returns shape (len(indices), 512), float32.
+        Downscaling happens HERE, not afterwards: at 2560x1440 a single frame is
+        11 MB, and keeping four dozen of them at full size would hold ~0.5 GB
+        while Ollama already occupies ~7 GB of a 14 GB machine.
         """
-        if not indices:
-            return np.zeros((0, 512), dtype=np.float32)
-
         import cv2
-        import torch
-        from PIL import Image
-        from transformers import CLIPProcessor, CLIPVisionModelWithProjection
 
-        # CLIPVisionModelWithProjection returns output.image_embeds — a plain
-        # tensor of projected features — regardless of transformers version.
-        model = CLIPVisionModelWithProjection.from_pretrained(_CLIP_MODEL_NAME)
-        processor = CLIPProcessor.from_pretrained(_CLIP_MODEL_NAME)
-        model.eval()
+        from docupilot.segmentation.gui_state_scoring import downscale
 
-        wanted = set(indices)
-        frames_bgr: dict[int, np.ndarray] = {}
+        frames: dict[int, np.ndarray] = {}
+        if not wanted:
+            return frames
         cap = cv2.VideoCapture(video_path)
-        frame_idx = 0
+        if not cap.isOpened():
+            return frames
+        last = max(wanted)
         try:
-            while wanted:
+            idx = 0
+            while idx <= last:
                 ret, bgr = cap.read()
                 if not ret:
                     break
-                if frame_idx in wanted:
-                    frames_bgr[frame_idx] = bgr
-                    wanted.discard(frame_idx)
-                frame_idx += 1
+                if idx in wanted:
+                    frames[idx] = downscale(bgr)
+                idx += 1
         finally:
             cap.release()
+        return frames
 
-        pil_frames = [
-            Image.fromarray(cv2.cvtColor(frames_bgr[i], cv2.COLOR_BGR2RGB))
-            for i in indices
-            if i in frames_bgr
-        ]
-        if not pil_frames:
-            return np.zeros((0, 512), dtype=np.float32)
-
-        embeddings: list[np.ndarray] = []
-        with torch.no_grad():
-            for start in range(0, len(pil_frames), _CLIP_BATCH_SIZE):
-                batch = pil_frames[start:start + _CLIP_BATCH_SIZE]
-                pixel_values = processor(images=batch, return_tensors="pt")["pixel_values"]
-                feats = model(pixel_values=pixel_values).image_embeds
-                feats = feats / feats.norm(dim=-1, keepdim=True)
-                embeddings.append(feats.cpu().numpy())
-
-        return np.concatenate(embeddings, axis=0).astype(np.float32)
-
-    # ── Main extraction ───────────────────────────────────────────────────────
+    # ── Extraction ────────────────────────────────────────────────────
 
     @staticmethod
     def extract_gui_features(
         recording_session: RecordingSession,
         fps: float,
+        use_cache: bool = True,
+        on_progress: Callable[[int, int], None] | None = None,
+        is_cancelled: Callable[[], bool] | None = None,
     ) -> np.ndarray:
         """
-        Extract graded GUI action-completion evidence from the video.
+        Graded action-boundary evidence for one recording.
 
-        :param recording_session: Recording session (.recording_path → MP4).
-        :param fps: Video frame rate in frames per second.
-        :return: np.ndarray of shape (T_v, 3), dtype float32.
+        On a CPU-only machine each state pair costs the VLM ~80 s, and a typical
+        recording has dozens — so this runs for minutes and MUST NOT be called on
+        a UI thread. on_progress / is_cancelled exist so a worker thread can
+        report and be stopped; both are optional and pure callbacks (no Qt here).
+
+        :param recording_session: session whose .recording_path points at the MP4.
+        :param fps: video frame rate.
+        :param use_cache: reuse verdicts cached in the session directory.
+        :param on_progress: called as (judged_pairs, total_pairs) after each pair.
+        :param is_cancelled: polled before each pair; return True to stop early
+            (the evidence gathered so far is kept and returned).
+        :return: (T_v, 3) float32 — onset flag, graded score, display flag.
+        :raises RuntimeError: when no Ollama server with the model is reachable.
         """
+        from docupilot.segmentation import gui_state_scoring as vlm
+
+        if not vlm.is_available():
+            hint = (
+                f"Cloud-Backend '{vlm.MODEL}' nicht nutzbar. Benötigt:\n"
+                "  poetry install         (Paket 'anthropic')\n"
+                "  ANTHROPIC_API_KEY=...  oder  ant auth login\n"
+                "Alternativ lokal: DOCUPILOT_VLM=ollama"
+                if vlm.BACKEND == "anthropic" else
+                f"Ollama nicht erreichbar ({vlm.OLLAMA_HOST}) oder Modell "
+                f"'{vlm.MODEL}' fehlt:\n"
+                f"  ollama serve\n"
+                f"  ollama pull {vlm.MODEL}"
+            )
+            raise RuntimeError(
+                hint + "\n\nOhne VLM kann die GUI-Modalität keine Handlungsgrenzen "
+                "bestimmen — ein rein struktureller Score misst Pixelmenge, nicht "
+                "Bedeutung."
+            )
+
         video_path = str(recording_session.recording_path)
-        spread = max(1, int(_GUI_SPREAD_S * fps))
-
-        # ── Pass 1: multi-scale pHash (full video, fast) ──────────────────────
-        phash_list, T_v = GUIActionBoundaryExtractor._scan_phashes(video_path)
-
-        features = np.zeros((T_v, 3), dtype=np.float32)
-        if T_v < 2:
+        hashes, activity = GUIActionBoundaryExtractor._scan(video_path)
+        features = np.zeros((len(hashes), 3), dtype=np.float32)
+        if len(hashes) < 2:
             return features
 
-        phash_dists = [0.0] + [
-            GUIActionBoundaryExtractor._max_phash_dist(phash_list[i - 1], phash_list[i])
-            for i in range(1, T_v)
-        ]
+        dwells = GUIActionBoundaryExtractor._dwells(
+            activity, max(1, round(_MIN_DWELL_S * fps))
+        )
+        if len(dwells) < 2:
+            return features
 
-        onset_raw = [i for i in range(1, T_v) if phash_dists[i] >= _PHASH_ONSET_THRESH]
-        for i in onset_raw:
-            features[i, 0] = 1.0
+        # One settled frame per dwell, sampled _SETTLE_OFFSET_S in and downscaled
+        # on read. The model sees them stitched into a BEFORE|AFTER composite.
+        offset = max(0, int(_SETTLE_OFFSET_S * fps))
+        settled = [min(end, start + offset) for start, end in dwells]
+        halves = GUIActionBoundaryExtractor._read_frames(video_path, set(settled))
 
-        dedup_gap = max(1, int(fps * _PHASH_DEDUP_WIN_S))
-        onset_deduped: list[int] = []
-        for f in onset_raw:
-            if not onset_deduped or f - onset_deduped[-1] > dedup_gap:
-                onset_deduped.append(f)
-
-        sat_range_ph = _PHASH_SATURATE - _PHASH_ONSET_THRESH
-        for f in onset_deduped:
-            raw_score = (phash_dists[f] - _PHASH_ONSET_THRESH) / sat_range_ph
-            score = float(np.clip(raw_score, 0.0, 1.0)) * _PHASH_EVIDENCE_CAP
-            _apply_gaussian(features, 1, f, score, spread, spread)
-
-        # ── Pass 2: CLIP semantic embeddings (sampled, primary) ───────────────
-        clip_indices = GUIActionBoundaryExtractor._clip_sample_indices(T_v, fps)
-        embeddings = GUIActionBoundaryExtractor._extract_clip_embeddings(
-            video_path, clip_indices
+        cache = (
+            vlm.Cache(recording_session.session_dir / "gui_vlm_cache.json")
+            if use_cache else None
         )
 
-        if embeddings.shape[0] >= 2:
-            # Cosine distance of L2-normalized vectors = 1 − dot product.
-            dots = np.einsum("nd,nd->n", embeddings[:-1], embeddings[1:])
-            cos_dists = (1.0 - np.clip(dots, -1.0, 1.0)).astype(np.float32)
+        anchor: int | None = None
+        calls = 0
+        total = max(0, len(dwells) - 1)               # upper bound on VLM calls
+        spread = max(1, int(_SPREAD_S * fps))
 
-            sat_range_cl = _CLIP_SATURATE - _CLIP_ONSET_THRESH
-            for j, dist in enumerate(cos_dists):
-                if dist < _CLIP_ONSET_THRESH:
-                    continue
-                # Assign evidence to the later frame (where the change became visible).
-                video_frame = clip_indices[j + 1] if j + 1 < len(clip_indices) else T_v - 1
-                if video_frame >= T_v:
-                    continue
-                raw_score = float(dist - _CLIP_ONSET_THRESH) / sat_range_cl
-                score = float(np.clip(raw_score, 0.0, 1.0)) * _CLIP_EVIDENCE_CAP
-                features[video_frame, 0] = 1.0
-                _apply_gaussian(features, 1, video_frame, score, spread, spread)
+        for (dwell_start, _), frame_idx in zip(dwells, settled):
+            if frame_idx not in halves:
+                continue
+            if anchor is None:                       # the workflow's starting point
+                anchor = frame_idx
+                continue
+            if calls >= _MAX_CALLS or (is_cancelled is not None and is_cancelled()):
+                break
 
-        features[:, 2] = (features[:, 1] >= _GUI_BOUNDARY_THRESHOLD).astype(np.float32)
+            # No changed region means the two settled states are pixel-identical:
+            # the same state, nothing to judge, no call to pay for. This replaces
+            # an earlier pHash identity check, which answered the same question
+            # but got it wrong — on a low-texture tile the hash flips on codec
+            # noise alone (see _changed_region).
+            region = GUIActionBoundaryExtractor._changed_region(
+                halves[anchor], halves[frame_idx]
+            )
+            if region is None:
+                continue
+
+            composite = vlm.encode_pair(halves[anchor], halves[frame_idx], region)
+            judgement = vlm.judge(composite, cache=cache)
+            calls += 1
+            if on_progress is not None:
+                on_progress(calls, total)
+            if judgement is None:                    # unusable answer: leave no
+                continue                             # evidence rather than guess
+
+            features[dwell_start, 0] = 1.0
+            _apply_gaussian(
+                features, 1, dwell_start, judgement.p_boundary, spread, spread
+            )
+            if judgement.p_boundary >= _ANCHOR_ADVANCE:
+                anchor = frame_idx                   # a new state is established
+
+        if cache is not None:
+            cache.flush()                            # also on cancel: keep what we paid for
+
+        features[:, 2] = (features[:, 1] >= _FLAG_THRESHOLD).astype(np.float32)
         return features
 
 

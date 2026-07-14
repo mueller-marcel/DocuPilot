@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from PySide6.QtCore import QTimer, Qt
+from PySide6.QtCore import QObject, QThread, QTimer, Qt, Signal
 from PySide6.QtMultimedia import QMediaPlayer
 from PySide6.QtWidgets import (
     QDialog,
@@ -21,6 +21,88 @@ _GROUND_TRUTH_COLOR = "#34d399"
 _EVENT_COLOR        = "#38bdf8"
 _SEMANTIC_COLOR     = "#a78bfa"
 _GUI_COLOR          = "#fb923c"
+
+# Must match _FLAG_THRESHOLD in feature_extraction — the lane's display flag.
+_GUI_FLAG_THRESHOLD = 0.5
+
+
+class _FeatureWorker(QObject):
+    """
+    Runs the extractors OFF the UI thread.
+
+    This is not a nicety. Whisper takes minutes, and the GUI extractor sends one
+    request per settled state pair to a local VLM — on a CPU-only machine that is
+    ~80 s each and dozens of them, so computing in the UI thread would freeze the
+    dialog for the better part of an hour and Windows would mark it as not
+    responding. The worker emits results; only the dialog touches widgets.
+    """
+
+    semantic_ready  = Signal(object, float)   # (features, hop_s)
+    semantic_failed = Signal(str)
+    gui_ready       = Signal(object, float)   # (features, fps)
+    gui_failed      = Signal(str)
+    gui_progress    = Signal(int, int)        # (judged pairs, total pairs)
+    finished        = Signal()
+
+    def __init__(self, session: RecordingSession, duration_ms: float) -> None:
+        super().__init__()
+        self._session = session
+        self._duration_ms = duration_ms
+        self._cancelled = False
+
+    def cancel(self) -> None:
+        """Ask the run to stop after the pair currently in flight."""
+        self._cancelled = True
+
+    def run(self) -> None:
+        # GUI first, audio second. Whisper takes minutes and blocks nothing that
+        # the GUI stage needs — running it first would mean staring at an empty
+        # GUI lane for the entire transcription before the first VLM verdict
+        # even starts.
+        self._run_gui()
+        if not self._cancelled:
+            self._run_semantic()
+        self.finished.emit()
+
+    def _run_semantic(self) -> None:
+        try:
+            import librosa
+
+            from docupilot.segmentation.feature_extraction import (
+                SemanticAudioFeatureExtractor,
+                TranscriptionExtractor,
+                _HOP_LENGTH,
+            )
+
+            full_text, words = TranscriptionExtractor.extract_transcript(self._session)
+            audio_raw, sr = librosa.load(str(self._session.recording_path))
+            n_frames = 1 + (len(audio_raw) - 2048) // _HOP_LENGTH
+            features = SemanticAudioFeatureExtractor.extract_semantic_features(
+                full_text, words, n_frames, float(sr)
+            )
+            self.semantic_ready.emit(features, _HOP_LENGTH / float(sr))
+        except Exception as exc:
+            self.semantic_failed.emit(str(exc))
+
+    def _run_gui(self) -> None:
+        try:
+            import cv2
+
+            from docupilot.segmentation.feature_extraction import GUIActionBoundaryExtractor
+
+            cap = cv2.VideoCapture(str(self._session.recording_path))
+            fps = cap.get(cv2.CAP_PROP_FPS) or 25.0
+            cap.release()
+
+            features = GUIActionBoundaryExtractor.extract_gui_features(
+                self._session,
+                fps=fps,
+                on_progress=lambda done, total: self.gui_progress.emit(done, total),
+                is_cancelled=lambda: self._cancelled,
+            )
+            self.gui_ready.emit(features, fps)
+        except Exception as exc:
+            self.gui_failed.emit(str(exc))
 
 
 class FeatureDialog(QDialog):
@@ -200,7 +282,9 @@ class FeatureDialog(QDialog):
 
         # ── GUI ──────────────────────────────────────────────────────────
         _add_separator()
-        _add_section_header("  ►  GUI-Handlungsgrenzen (OmniParser: neue & modifizierte Elemente)")
+        _add_section_header(
+            "  ►  GUI-Handlungsgrenzen (pHash-Zustände + VLM: neuer Zustand?)"
+        )
 
         self._gui_canvas = _add_lane(
             "GUI-Boundary-Score  +  Onset-Flag  +  Boundary-Flag", _GUI_COLOR, False, height=180
@@ -231,111 +315,119 @@ class FeatureDialog(QDialog):
         self._timer.timeout.connect(self._sync_cursor)
         self._timer.start()
 
-        QTimer.singleShot(50, self._compute_features)
+        self._semantic_status = "Semantik: wartet …"
+        self._gui_status = "GUI: läuft …"
+        self._thread: QThread | None = None
+        self._worker: _FeatureWorker | None = None
+        QTimer.singleShot(50, self._start_worker)
 
-    def _compute_features(self) -> None:
-        """
-        Extract semantic and GUI features and populate all canvas lanes.
+    # ── Worker lifecycle ─────────────────────────────────────────────────
 
-        :return: None
-        """
-        try:
-            import numpy as np
-            import librosa
-            from docupilot.segmentation.feature_extraction import (
-                TranscriptionExtractor,
-                SemanticAudioFeatureExtractor,
-                GUIActionBoundaryExtractor,
-            )
+    def _start_worker(self) -> None:
+        """Kick off feature extraction on a background thread."""
+        # The player only knows the duration once it has probed the file; at
+        # dialog-open time it can still report 0, which would put every marker
+        # at t=0. Ask once more here.
+        live_duration = float(self._player.duration())
+        if live_duration > 0:
+            self._duration_ms = live_duration
+            for canvas in self._canvases:
+                canvas.set_duration(live_duration)
 
-            # _compute_features läuft 50ms nach dem Öffnen des Dialogs — noch
-            # bevor der erste _sync_cursor-Tick (80ms) die Dauer korrigieren
-            # konnte. Deshalb hier zusätzlich direkt beim Player nachfragen,
-            # damit hop_s (und damit alle Semantik-/GUI-Markerpositionen)
-            # nicht versehentlich mit einer noch unbekannten Dauer von 0
-            # berechnet werden.
-            live_duration = float(self._player.duration())
-            if live_duration > 0:
-                self._duration_ms = live_duration
-                for canvas in self._canvases:
-                    canvas.set_duration(live_duration)
+        self._thread = QThread(self)
+        self._worker = _FeatureWorker(self._session, self._duration_ms)
+        self._worker.moveToThread(self._thread)
 
-            # ── Semantische Features ──────────────────────────────────────────
-            try:
-                full_text, words = TranscriptionExtractor.extract_transcript(self._session)
-                audio_raw, sr = librosa.load(str(self._session.recording_path))
-                _HOP_LENGTH = 512
-                T_sem = 1 + (len(audio_raw) - 2048) // _HOP_LENGTH
-                semantic_features = SemanticAudioFeatureExtractor.extract_semantic_features(
-                    full_text, words, T_sem, float(sr)
-                )
+        self._thread.started.connect(self._worker.run)
+        self._worker.semantic_ready.connect(self._on_semantic_ready)
+        self._worker.semantic_failed.connect(self._on_semantic_failed)
+        self._worker.gui_ready.connect(self._on_gui_ready)
+        self._worker.gui_failed.connect(self._on_gui_failed)
+        self._worker.gui_progress.connect(self._on_gui_progress)
+        self._worker.finished.connect(self._thread.quit)
 
-                nli_score_signal = semantic_features[:, 1].tolist()
-                cluster_frames = np.where(semantic_features[:, 0] > 0.5)[0]
-                hop_s = (self._duration_ms / 1000.0) / T_sem if T_sem > 0 else 0.0
-                cluster_markers_ms = [
-                    (int(f) * hop_s * 1000.0, "verb_cluster") for f in cluster_frames
-                ]
-                flag_frames = np.where(semantic_features[:, 2] > 0.5)[0]
-                flag_markers_ms = [
-                    (int(f) * hop_s * 1000.0, "nli_flag") for f in flag_frames
-                ]
-                self._semantic_canvas.set_data(
-                    [("NLI-Score", nli_score_signal, _SEMANTIC_COLOR, True)],
-                    self._duration_ms,
-                )
-                self._semantic_canvas.set_semantic_markers(
-                    cluster_markers=cluster_markers_ms,
-                    flag_markers=flag_markers_ms,
-                )
-                self._status.setText(
-                    f"  Semantik: {len(flag_frames)} NLI-Boundary-Kandidaten"
-                )
-            except Exception as sem_exc:
-                self._semantic_canvas.set_data([], self._duration_ms)
-                self._status.setText(f"  Semantik: Fehler ({sem_exc})")
+        self._thread.start()
+        self._refresh_status()
 
-            # ── GUI-Zustandsänderungen (OmniParser) ───────────────────────────
-            try:
-                import cv2 as _cv2
-                _cap = _cv2.VideoCapture(str(self._session.recording_path))
-                fps = _cap.get(_cv2.CAP_PROP_FPS) or 25.0
-                T_v = int(_cap.get(_cv2.CAP_PROP_FRAME_COUNT))
-                _cap.release()
+    def _refresh_status(self) -> None:
+        self._status.setText(f"  {self._semantic_status}  ·  {self._gui_status}")
 
-                gui_features = GUIActionBoundaryExtractor.extract_gui_features(
-                    self._session,
-                    fps=fps,
-                )
+    # ── Worker results ───────────────────────────────────────────────────
 
-                gui_score_signal = gui_features[:, 1].tolist()
-                keyframe_frames = np.where(gui_features[:, 0] > 0.5)[0]
-                hop_s_v = (self._duration_ms / 1000.0) / T_v if T_v > 0 else 0.0
-                keyframe_markers_ms = [
-                    (int(f) * hop_s_v * 1000.0, "onset") for f in keyframe_frames
-                ]
-                gui_flag_frames = np.where(gui_features[:, 2] > 0.5)[0]
-                gui_flag_markers_ms = [
-                    (int(f) * hop_s_v * 1000.0, "gui_boundary") for f in gui_flag_frames
-                ]
-                self._gui_canvas.set_data(
-                    [("GUI-Boundary-Score", gui_score_signal, _GUI_COLOR, True)],
-                    self._duration_ms,
-                )
-                self._gui_canvas.set_semantic_markers(
-                    cluster_markers=keyframe_markers_ms,
-                    flag_markers=gui_flag_markers_ms,
-                )
-                self._status.setText(
-                    self._status.text()
-                    + f"  ·  GUI: {len(gui_flag_frames)} Boundary-Kandidaten"
-                )
-            except Exception as gui_exc:
-                self._gui_canvas.set_data([], self._duration_ms)
-                self._status.setText(self._status.text() + f"  ·  GUI: Fehler ({gui_exc})")
+    def _on_semantic_ready(self, features, hop_s: float) -> None:
+        import numpy as np
 
-        except Exception as exc:
-            self._status.setText(f"Fehler beim Berechnen: {exc}")
+        self._semantic_canvas.set_data(
+            [("NLI-Score", features[:, 1].tolist(), _SEMANTIC_COLOR, True)],
+            self._duration_ms,
+        )
+        self._semantic_canvas.set_semantic_markers(
+            cluster_markers=[
+                (float(f) * hop_s * 1000.0, "verb_cluster")
+                for f in np.where(features[:, 0] > 0.5)[0]
+            ],
+            flag_markers=[
+                (float(f) * hop_s * 1000.0, "nli_flag")
+                for f in np.where(features[:, 2] > 0.5)[0]
+            ],
+        )
+        n_flags = int((features[:, 2] > 0.5).sum())
+        self._semantic_status = f"Semantik: {n_flags} NLI-Kandidaten"
+        self._refresh_status()
+
+    def _on_semantic_failed(self, message: str) -> None:
+        self._semantic_canvas.set_data([], self._duration_ms)
+        self._semantic_status = f"Semantik: Fehler ({message})"
+        self._refresh_status()
+
+    def _on_gui_progress(self, done: int, total: int) -> None:
+        from docupilot.segmentation import gui_state_scoring as vlm
+
+        self._gui_status = f"GUI: {done}/{total} Zustandspaare [{vlm.MODEL}]"
+        self._refresh_status()
+
+    def _on_gui_ready(self, features, fps: float) -> None:
+        import numpy as np
+
+        from docupilot.segmentation import gui_state_scoring as vlm
+
+        # Frame index -> time straight from the fps the extractor used. The old
+        # code derived a hop from duration / CAP_PROP_FRAME_COUNT — but that
+        # count is a container estimate and need not equal the number of frames
+        # actually decoded (which is what the feature array is indexed by), so
+        # every GUI marker could sit at a proportionally wrong time.
+        def t_ms(frame: int) -> float:
+            return float(frame) / fps * 1000.0
+
+        self._gui_canvas.set_data(
+            [("GUI-Boundary-Score", features[:, 1].tolist(), _GUI_COLOR, True)],
+            self._duration_ms,
+        )
+        self._gui_canvas.set_semantic_markers(
+            cluster_markers=[
+                (t_ms(f), "onset") for f in np.where(features[:, 0] > 0.5)[0]
+            ],
+            flag_markers=[
+                (t_ms(f), "gui_boundary") for f in np.where(features[:, 2] > 0.5)[0]
+            ],
+        )
+        # Count ONSET frames that clear the threshold — one per judged transition.
+        # Counting the flag lane instead would count the Gaussian skirt: every
+        # boundary is spread over ~±0.6 s, so 12 boundaries read as 25 "seconds
+        # above threshold". That miscount is what made a correct run look broken.
+        n_judged = int((features[:, 0] > 0.5).sum())
+        onsets = np.where(features[:, 0] > 0.5)[0]
+        n_boundaries = int((features[onsets, 1] >= _GUI_FLAG_THRESHOLD).sum())
+        self._gui_status = (
+            f"GUI: {n_boundaries} Grenzen aus {n_judged} Zustandspaaren [{vlm.MODEL}]"
+        )
+        self._semantic_status = "Semantik: läuft …"
+        self._refresh_status()
+
+    def _on_gui_failed(self, message: str) -> None:
+        self._gui_canvas.set_data([], self._duration_ms)
+        self._gui_status = f"GUI: Fehler ({message})"
+        self._refresh_status()
 
     def _sync_cursor(self) -> None:
         """
@@ -377,10 +469,21 @@ class FeatureDialog(QDialog):
 
     def closeEvent(self, event) -> None:
         """
-        Stop the cursor timer before closing.
+        Stop the cursor timer and the extraction thread before closing.
+
+        Without this the worker would keep judging state pairs long after the
+        dialog is gone — minutes to an hour of a local VLM running for a window
+        nobody is looking at. Verdicts already paid for stay in the cache, so a
+        cancelled run is not wasted: reopening the dialog resumes from there.
 
         :param event: The close event.
         :return: None
         """
         self._timer.stop()
+        if self._worker is not None:
+            self._worker.cancel()
+        if self._thread is not None and self._thread.isRunning():
+            self._thread.quit()
+            # A pair in flight can still be blocked on the VLM; give it room.
+            self._thread.wait(120_000)
         super().closeEvent(event)

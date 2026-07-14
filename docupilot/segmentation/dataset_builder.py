@@ -312,7 +312,7 @@ def build_session_evidence(
     Run all three extractors for one RecordingSession and assemble a
     SessionEvidence on the video frame grid.
     """
-    from feature_extraction import (
+    from docupilot.segmentation.feature_extraction import (
         _HOP_LENGTH,
         EventFeatureExtractor,
         GUIActionBoundaryExtractor,

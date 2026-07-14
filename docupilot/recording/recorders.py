@@ -6,7 +6,6 @@ import threading
 import time
 from datetime import datetime, timezone
 
-import cv2
 import mss
 import numpy as np
 import pynput
@@ -28,9 +27,6 @@ class AvRecorder:
         geo = session.screen.geometry()
         self._w = geo.width()
         self._h = geo.height()
-        self._cursor_x: int = 0
-        self._cursor_y: int = 0
-        self._cursor_lock = threading.Lock()
 
     def start(self) -> None:
         self._stop.clear()
@@ -95,7 +91,6 @@ class AvRecorder:
                     screenshot.height, screenshot.width, 4
                 )
                 bgr = bgra[:, :, :3].copy()
-                self._draw_cursor(bgr, geo.x(), geo.y())
 
                 try:
                     if self._proc and self._proc.stdin:
@@ -110,29 +105,11 @@ class AvRecorder:
                 if remaining_ns > 0:
                     time.sleep(remaining_ns / 1e9)
 
-    def update_cursor_pos(self, x: int, y: int) -> None:
-        with self._cursor_lock:
-            self._cursor_x = x
-            self._cursor_y = y
-
-    def _draw_cursor(self, bgr: np.ndarray, screen_x: int, screen_y: int) -> None:
-        with self._cursor_lock:
-            cx = self._cursor_x - screen_x
-            cy = self._cursor_y - screen_y
-
-        h, w = bgr.shape[:2]
-        if not (0 <= cx < w and 0 <= cy < h):
-            return
-
-        size = max(8, int(h * 0.018))
-        pts = np.array([
-            [cx,            cy               ],
-            [cx,            cy + size        ],
-            [cx + size // 2, cy + int(size * 0.65)],
-        ], dtype=np.int32)
-
-        cv2.fillPoly(bgr, [pts + 1], (0, 0, 0))
-        cv2.fillPoly(bgr, [pts],     (255, 255, 255))
+    # The mouse cursor is deliberately NOT drawn into the frames. mss does not
+    # capture it, and painting it in would (a) inject the event stream into the
+    # video modality — the two must stay independent for the Shapley ablation —
+    # and (b) make every settled frame differ from the next by a moving arrow,
+    # which is exactly the noise the pHash dwell detection has to see through.
 
     @staticmethod
     def _finalize(proc: subprocess.Popen, on_done=None) -> None:
@@ -188,18 +165,17 @@ class AvRecorder:
 
 
 class InputRecorder:
-    def __init__(self, session: RecordingSession, writer: EventWriter,
-                 av_recorder: AvRecorder | None = None) -> None:
+    def __init__(self, session: RecordingSession, writer: EventWriter) -> None:
         self._session = session
         self._writer = writer
-        self._av_recorder = av_recorder
         self._mouse: pynput.mouse.Listener | None = None
         self._keyboard: pynput.keyboard.Listener | None = None
 
     def start(self) -> None:
         self._writer.write({"type": "input_started"}, t_ms=self._session.session_time_ms())
+        # No on_move handler: pointer motion is not an event we record, and the
+        # AvRecorder no longer needs the cursor position (it does not draw it).
         self._mouse = pynput.mouse.Listener(
-            on_move=self._on_move,
             on_click=self._on_click,
             on_scroll=self._on_scroll,
         )
@@ -218,10 +194,6 @@ class InputRecorder:
             self._keyboard.stop()
             self._keyboard = None
         self._writer.write({"type": "input_stopped"}, t_ms=self._session.session_time_ms())
-
-    def _on_move(self, x: int, y: int) -> None:
-        if self._av_recorder is not None:
-            self._av_recorder.update_cursor_pos(x, y)
 
     def _on_click(self, x: int, y: int, button, pressed: bool) -> None:
         self._writer.write(
@@ -288,7 +260,7 @@ class RecorderService(QObject):
                 session, self._writer,
                 on_done=lambda: self.recording_finalized.emit(session),
             )
-            self._input = InputRecorder(session, self._writer, self._av)
+            self._input = InputRecorder(session, self._writer)
             self._av.start()
             self._input.start()
             self._writer.write(
