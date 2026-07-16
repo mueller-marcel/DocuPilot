@@ -314,9 +314,9 @@ def build_session_evidence(
     """
     from docupilot.segmentation.feature_extraction import (
         _HOP_LENGTH,
+        AudioBoundaryExtractor,
         EventFeatureExtractor,
         GUIActionBoundaryExtractor,
-        SemanticAudioFeatureExtractor,
         TranscriptionExtractor,
     )
 
@@ -331,12 +331,12 @@ def build_session_evidence(
     audio_fps = audio_sampling_rate / _HOP_LENGTH
     duration_s = T_v / fps
     n_audio_frames = int(round(duration_s * audio_fps))
-    sem = SemanticAudioFeatureExtractor.extract_semantic_features(
-        full_text, words, n_audio_frames, audio_sampling_rate
+    aud = AudioBoundaryExtractor.extract_audio_features(
+        recording_session, full_text, words, n_audio_frames, audio_sampling_rate
     )
     audio_times_s = np.arange(n_audio_frames) / audio_fps
-    sem_on_grid = resample_to_grid(sem[:, :2], audio_times_s, frame_times_s)
-    sem_on_grid = rebinarize_flags(sem_on_grid, flag_columns=[0])
+    aud_on_grid = resample_to_grid(aud[:, :2], audio_times_s, frame_times_s)
+    aud_on_grid = rebinarize_flags(aud_on_grid, flag_columns=[0])
 
     # Event evidence (computed directly on the video grid).
     ev = EventFeatureExtractor.extract_event_boundary_evidence(
@@ -349,7 +349,7 @@ def build_session_evidence(
         frame_times_s=frame_times_s,
         evidence={
             "video":  gui[:, :2].astype(np.float32),
-            "audio":  sem_on_grid.astype(np.float32),
+            "audio":  aud_on_grid.astype(np.float32),
             "events": ev[:, :2].astype(np.float32),
         },
         ground_truth_s=load_ground_truth(annotation_path),

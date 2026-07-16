@@ -69,7 +69,7 @@ class _FeatureWorker(QObject):
             import librosa
 
             from docupilot.segmentation.feature_extraction import (
-                SemanticAudioFeatureExtractor,
+                AudioBoundaryExtractor,
                 TranscriptionExtractor,
                 _HOP_LENGTH,
             )
@@ -77,8 +77,8 @@ class _FeatureWorker(QObject):
             full_text, words = TranscriptionExtractor.extract_transcript(self._session)
             audio_raw, sr = librosa.load(str(self._session.recording_path))
             n_frames = 1 + (len(audio_raw) - 2048) // _HOP_LENGTH
-            features = SemanticAudioFeatureExtractor.extract_semantic_features(
-                full_text, words, n_frames, float(sr)
+            features = AudioBoundaryExtractor.extract_audio_features(
+                self._session, full_text, words, n_frames, float(sr)
             )
             self.semantic_ready.emit(features, _HOP_LENGTH / float(sr))
         except Exception as exc:
@@ -107,11 +107,13 @@ class _FeatureWorker(QObject):
 
 class FeatureDialog(QDialog):
     """
-    Non-modal dialog with one timeline per audio/video feature plus a
-    dedicated event timeline, built from FeatureTimelineWidget. Audio
-    columns: RMS, pause duration, pitch reset, energy jump, speech rate.
-    Shares cursor and boundary lines across all timelines; clicking a
-    timeline seeks the player.
+    Non-modal dialog with one FeatureTimelineWidget lane per modality: the
+    audio boundary score, the GUI action-boundary score, an input-event lane
+    and a ground-truth lane. This dialog is the ADAPTER — it runs the
+    extractors off the UI thread and maps their (T, 3) evidence arrays onto the
+    lanes; the extraction lives entirely in feature_extraction, the drawing
+    entirely in FeatureTimelineWidget. Shares cursor and boundary lines across
+    all lanes; clicking a lane seeks the player.
 
     Ground-Truth-Grenzen werden ausschließlich aus
     session.ground_truth_markers() bezogen — sowohl für die gestrichelten
@@ -274,10 +276,10 @@ class FeatureDialog(QDialog):
 
         # ── Semantik ─────────────────────────────────────────────────────
         _add_separator()
-        _add_section_header("  ►  Semantische Merkmale (NLI Boundary-Kandidaten)")
+        _add_section_header("  ►  Audio (Ansage-Fenster, LLM-bewertet)")
 
         self._semantic_canvas = _add_lane(
-            "NLI-Score  +  Verb-Cluster  +  Boundary-Flag", _SEMANTIC_COLOR, False, height=180
+            "Audio-Score  ·  Grenze im Fenster erwartet", _SEMANTIC_COLOR, False, height=180
         )
 
         # ── GUI ──────────────────────────────────────────────────────────
@@ -358,21 +360,25 @@ class FeatureDialog(QDialog):
         import numpy as np
 
         self._semantic_canvas.set_data(
-            [("NLI-Score", features[:, 1].tolist(), _SEMANTIC_COLOR, True)],
+            [("Audio-Score", features[:, 1].tolist(), _SEMANTIC_COLOR, True)],
             self._duration_ms,
         )
-        self._semantic_canvas.set_semantic_markers(
-            cluster_markers=[
-                (float(f) * hop_s * 1000.0, "verb_cluster")
-                for f in np.where(features[:, 0] > 0.5)[0]
-            ],
-            flag_markers=[
-                (float(f) * hop_s * 1000.0, "nli_flag")
-                for f in np.where(features[:, 2] > 0.5)[0]
-            ],
+        # One marker per execution window: the strongest frame of each contiguous
+        # flagged run (col 2). Marking every flagged frame would draw a band
+        # instead of a line — the evidence is a wide bump, not a spike. The
+        # sentence onsets (col 0) are NOT the boundaries: audio expects the
+        # completion inside the window, not at the announcement that opens it.
+        flagged = features[:, 2] > 0.5
+        edges = np.diff(np.concatenate(([0], flagged.view(np.int8), [0])))
+        starts = np.where(edges == 1)[0]
+        ends = np.where(edges == -1)[0]
+        boundaries = [
+            int(lo + np.argmax(features[lo:hi, 1])) for lo, hi in zip(starts, ends)
+        ]
+        self._semantic_canvas.set_detected_boundaries(
+            [float(f) * hop_s * 1000.0 for f in boundaries]
         )
-        n_flags = int((features[:, 2] > 0.5).sum())
-        self._semantic_status = f"Semantik: {n_flags} NLI-Kandidaten"
+        self._semantic_status = f"Audio: {len(boundaries)} Grenzen"
         self._refresh_status()
 
     def _on_semantic_failed(self, message: str) -> None:
@@ -403,23 +409,16 @@ class FeatureDialog(QDialog):
             [("GUI-Boundary-Score", features[:, 1].tolist(), _GUI_COLOR, True)],
             self._duration_ms,
         )
-        self._gui_canvas.set_semantic_markers(
-            cluster_markers=[
-                (t_ms(f), "onset") for f in np.where(features[:, 0] > 0.5)[0]
-            ],
-            flag_markers=[
-                (t_ms(f), "gui_boundary") for f in np.where(features[:, 2] > 0.5)[0]
-            ],
-        )
-        # Count ONSET frames that clear the threshold — one per judged transition.
-        # Counting the flag lane instead would count the Gaussian skirt: every
-        # boundary is spread over ~±0.6 s, so 12 boundaries read as 25 "seconds
-        # above threshold". That miscount is what made a correct run look broken.
-        n_judged = int((features[:, 0] > 0.5).sum())
+        # One marker per boundary: onset frames (col 0, one per judged
+        # transition) that clear the flag threshold. Filtering col 2 alone would
+        # place a marker on every frame of the Gaussian skirt (~±0.6 s) and draw
+        # a band — the same over-count that once made 12 boundaries read as 25.
         onsets = np.where(features[:, 0] > 0.5)[0]
-        n_boundaries = int((features[onsets, 1] >= _GUI_FLAG_THRESHOLD).sum())
+        boundaries = [f for f in onsets if features[f, 1] >= _GUI_FLAG_THRESHOLD]
+        self._gui_canvas.set_detected_boundaries([t_ms(f) for f in boundaries])
         self._gui_status = (
-            f"GUI: {n_boundaries} Grenzen aus {n_judged} Zustandspaaren [{vlm.MODEL}]"
+            f"GUI: {len(boundaries)} Grenzen aus {len(onsets)} Zustandspaaren "
+            f"[{vlm.MODEL}]"
         )
         self._semantic_status = "Semantik: läuft …"
         self._refresh_status()

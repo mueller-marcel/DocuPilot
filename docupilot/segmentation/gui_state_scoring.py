@@ -91,7 +91,8 @@ OLLAMA_HOST = os.environ.get("OLLAMA_HOST", "http://localhost:11434")
 MODEL = CLOUD_MODEL if BACKEND == "anthropic" else OLLAMA_MODEL
 
 # Bump when the prompt or the score mapping changes — invalidates cached verdicts.
-PROMPT_VERSION = "v6"   # v6: Set-of-Mark box + zoom row
+PROMPT_VERSION = "v7"   # v7: goal-vs-means definition + async results (see
+                        # docs/annotationsleitfaden.md); v6: Set-of-Mark box + zoom
 
 # The two frames are stitched into ONE composite image, BEFORE left, AFTER right.
 #
@@ -111,11 +112,15 @@ _JPEG_QUALITY = 80
 
 _BOUNDARY = "ACTION_COMPLETED"
 _CATEGORIES = (
-    _BOUNDARY,        # user-triggered, system now rests in a NEW persistent state
-    "TRANSIENT_UI",   # menu/dropdown/dialog/tab/selection — an affordance only
-    "IN_PROGRESS",    # mid-typing, mid-scroll, spinner: the action is not done
+    _BOUNDARY,        # finished RESULT of a user operation, now persistent —
+                      # incl. a deliberate view/mode change and delayed async
+                      # results (build/test/filter finishing). See the boundary
+                      # definition in docs/annotationsleitfaden.md.
+    "TRANSIENT_UI",   # overlay/selection, or navigation the user passes through
+    "IN_PROGRESS",    # mid-typing, mid-scroll, spinner: the operation is not done
     "NO_CHANGE",      # caret, clock, codec noise
-    "SYSTEM_INITIATED",  # notification, autosave toast: the user did not cause it
+    "SYSTEM_INITIATED",  # unsolicited system change (notification/toast), NOT a
+                         # delayed result of a user action
 )
 
 _SYSTEM = """\
@@ -149,24 +154,38 @@ one category:
 
   NO_CHANGE         Nothing differs, or only a blinking caret / clock / codec
                     noise. If step 1 found no difference, you MUST pick this.
-  TRANSIENT_UI      What appeared or vanished is only an affordance the user is
-                    navigating: a menu, a dropdown, a submenu, a dialog box, a
-                    ribbon tab, a tooltip, a context menu, a highlighted
-                    selection. The underlying document/data is unchanged.
-  IN_PROGRESS       The same action is still running: text half typed into a
+  TRANSIENT_UI      An overlay or intermediate the user is only passing THROUGH,
+                    or a move that merely relocates: a menu, dropdown, submenu,
+                    dialog, tooltip or context menu that is open; a highlighted
+                    selection; scrolling, or switching to another sheet / page /
+                    folder the user has not yet done anything to. Nothing was
+                    carried out here — it is on the way to an action.
+  IN_PROGRESS       The same operation is still running: text half typed into a
                     field, a scroll mid-motion, a spinner, a half-painted frame.
-  SYSTEM_INITIATED  The user did not cause it: a notification, an autosave toast.
-  ACTION_COMPLETED  The user triggered something and the system now rests in a
-                    NEW, PERSISTENT state that outlives the interaction: a
-                    document opened, a filter or sort applied to the data, a
-                    dialog confirmed and its effect visible, a typed value
-                    committed, formatting applied, a row deleted, a sheet
-                    created, content pasted.
+  SYSTEM_INITIATED  A change the user did NOT trigger and did not request: an
+                    incoming notification, a chat or mail popup, an autosave
+                    toast, a clock tick. NOT the delayed result of something the
+                    user just started — that is ACTION_COMPLETED.
+  ACTION_COMPLETED  The finished RESULT of an operation the user carried out is
+                    now visible and persists. Three cases count:
+                    (1) content or structure changed — a filter or sort applied,
+                        a typed value committed, formatting applied, a row
+                        deleted, a sheet / folder / slide created, a file moved,
+                        content pasted, a document opened;
+                    (2) a view or mode the user switched to ON PURPOSE that
+                        transforms how the content is presented and stays — a
+                        reading view, a details view, a persistent zoom;
+                    (3) the DELAYED result of a user-triggered operation
+                        appearing on its own — a filter finishing, a build or
+                        test completing, a page or document finishing loading.
 
-The decisive question for ACTION_COMPLETED is whether the DATA or DOCUMENT
-changed, not how many pixels moved. A dropdown opening repaints far more of the
-screen than a filter being applied - and the dropdown is not an action while the
-filter is. Size is not importance.
+The decisive question is whether this is the finished RESULT of an operation the
+user carried out — a goal reached that persists — not how many pixels moved, and
+NOT whether it is "data" versus "view". A view or mode the user deliberately
+switched to counts; a menu they opened on the way does not; merely scrolling or
+switching to where they will act next does not. A dropdown opening repaints far
+more of the screen than a filter being applied, yet only the filter is an action.
+Size is not importance.
 
 The mouse cursor is not recorded, so you will never see a pointer.
 

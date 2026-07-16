@@ -7,8 +7,20 @@ from PySide6.QtWidgets import QSizePolicy, QWidget
 
 class FeatureTimelineWidget(QWidget):
     """
-    Reusable timeline widget for one lane: draws a feature curve and/or
-    event markers. Data-agnostic, fed via set_data()/set_events()/set_boundaries().
+    Reusable timeline lane — a pure VIEW.
+
+    It draws exactly what it is handed and derives nothing. Everything on screen
+    is fed in through a setter:
+      set_data                — the feature curve(s) from feature_extraction
+      set_detected_boundaries — the boundaries feature_extraction determined
+      set_boundaries          — the annotated ground truth (from the session)
+      set_events              — input-event markers
+      set_cursor / set_duration — playback state
+
+    No thresholding, peak/minimum picking, smoothing or normalisation happens
+    here: that is feature_extraction's job. The widget maps value → pixel and
+    time → pixel, nothing more. Curve values are expected already normalised to
+    [0, 1].
     """
 
     seek_requested = Signal(float)
@@ -40,9 +52,12 @@ class FeatureTimelineWidget(QWidget):
         self._boundaries: list[float] = []
         self._events: list[tuple[float, str]] = []
         self._event_color = event_color
-        # Semantic marker state — only used by the NLI lane
-        self._cluster_markers: list[tuple[float, str]] = []   # (t_ms, "verb_cluster")
-        self._flag_markers:    list[tuple[float, str]] = []   # (t_ms, "nli_flag")
+        # Determined boundaries (GUI and NLI lanes): timestamps in ms, one per
+        # detected boundary, drawn as a single prominent marker each. Replaces
+        # the old two-layer scheme (a dashed line at every judged onset plus a
+        # mid-height diamond at every flag), which buried the result under the
+        # candidates.
+        self._detected_boundaries: list[float] = []
         self.setMinimumHeight(160)
         self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
         self.setCursor(Qt.CursorShape.CrossCursor)
@@ -111,22 +126,18 @@ class FeatureTimelineWidget(QWidget):
         self._events = events
         self.update()
 
-    def set_semantic_markers(
-        self,
-        cluster_markers: list[tuple[float, str]],
-        flag_markers: list[tuple[float, str]],
-    ) -> None:
+    def set_detected_boundaries(self, boundaries_ms: list[float]) -> None:
         """
-        Set semantic boundary markers for the NLI lane.
+        Set the boundaries the model determined for this lane.
 
-        :param cluster_markers: List of (t_ms, "verb_cluster") — drawn as thin
-            violet vertical lines marking where a new verb cluster starts.
-        :param flag_markers: List of (t_ms, "nli_flag") — drawn as filled
-            diamond shapes marking hard NLI boundary candidates.
+        Each is drawn as one prominent marker (a solid line capped with a
+        triangle). Distinct from set_boundaries(), which holds the annotated
+        ground truth.
+
+        :param boundaries_ms: Boundary timestamps in milliseconds.
         :return: None
         """
-        self._cluster_markers = cluster_markers
-        self._flag_markers = flag_markers
+        self._detected_boundaries = boundaries_ms
         self.update()
 
     def mousePressEvent(self, event) -> None:
@@ -204,7 +215,7 @@ class FeatureTimelineWidget(QWidget):
                 p.setPen(boundary_pen)
                 p.drawLine(bx, pt, bx, pt + plot_h)
 
-        for label, values, hex_color, do_fill in self._tracks:
+        for _label, values, hex_color, do_fill in self._tracks:
             n = len(values)
             if n < 2:
                 continue
@@ -229,15 +240,6 @@ class FeatureTimelineWidget(QWidget):
             for i in range(n - 1):
                 p.drawLine(xs[i], ys[i], xs[i + 1], ys[i + 1])
 
-            if label == "RMS":
-                min_pen = QPen(QColor(hex_color))
-                min_pen.setWidth(1)
-                p.setPen(min_pen)
-                p.setBrush(QBrush(QColor(hex_color)))
-                for i in range(1, n - 1):
-                    if values[i] < values[i - 1] and values[i] < values[i + 1] and values[i] < 0.30:
-                        p.drawEllipse(xs[i] - 3, ys[i] - 3, 6, 6)
-
         if self._duration_ms > 0:
             cx = pl + int(self._cursor_ms / self._duration_ms * plot_w)
             cursor_pen = QPen(QColor("#ffffff"))
@@ -255,47 +257,27 @@ class FeatureTimelineWidget(QWidget):
                 ex = pl + int(ev_ms / self._duration_ms * plot_w)
                 p.drawEllipse(int(ex - radius), int(marker_y - radius), radius * 2, radius * 2)
 
-        # ── Semantic markers (NLI lane only) ──────────────────────────────────
-        if self._duration_ms > 0 and (self._cluster_markers or self._flag_markers):
-            # 1. Verb-cluster boundaries: thin violet dashed vertical lines
-            cluster_pen = QPen(QColor("#a78bfa"))
-            cluster_pen.setWidth(1)
-            cluster_pen.setStyle(Qt.PenStyle.DashLine)
-            for t_ms, _ in self._cluster_markers:
-                cx_ = pl + int(t_ms / self._duration_ms * plot_w)
-                p.setPen(cluster_pen)
-                p.drawLine(cx_, pt, cx_, pt + plot_h)
-                # Small label "V" at top
-                p.setPen(QColor("#a78bfa"))
-                p.setFont(QFont("monospace", 7))
-                p.drawText(cx_ + 2, pt + 2, 12, 12, Qt.AlignmentFlag.AlignLeft, "V")
-
-            # 2. NLI hard-flag candidates: filled diamond at mid-height
-            diamond_color = QColor("#f0abfc")   # fuchsia — distinct from curve violet
-            p.setPen(Qt.PenStyle.NoPen)
-            p.setBrush(QBrush(diamond_color))
-            mid_y = pt + plot_h // 2
-            r = 6
-            for t_ms, _ in self._flag_markers:
-                fx = pl + int(t_ms / self._duration_ms * plot_w)
-                # Diamond: four points around center
-                from PySide6.QtGui import QPolygon
-                from PySide6.QtCore import QPoint
-                diamond = QPolygon([
-                    QPoint(fx,     mid_y - r),   # top
-                    QPoint(fx + r, mid_y),        # right
-                    QPoint(fx,     mid_y + r),   # bottom
-                    QPoint(fx - r, mid_y),        # left
-                ])
-                p.drawPolygon(diamond)
-                # Thin outline for clarity
-                outline_pen = QPen(QColor("#ffffff"))
-                outline_pen.setWidth(1)
-                p.setPen(outline_pen)
+        # ── Determined boundaries: one prominent marker each ──────────────────
+        # A solid vertical line capped with a triangle at the top edge. Fuchsia,
+        # so it stays distinct from the curve (lane colour), the ground-truth
+        # boundaries (dashed dark orange) and the playback cursor (white).
+        if self._duration_ms > 0 and self._detected_boundaries:
+            marker_color = QColor("#f0abfc")
+            line_pen = QPen(marker_color)
+            line_pen.setWidth(2)
+            s = 5   # triangle half-width
+            for t_ms in self._detected_boundaries:
+                bx = pl + int(t_ms / self._duration_ms * plot_w)
+                p.setPen(line_pen)
                 p.setBrush(Qt.BrushStyle.NoBrush)
-                p.drawPolygon(diamond)
+                p.drawLine(bx, pt, bx, pt + plot_h)
                 p.setPen(Qt.PenStyle.NoPen)
-                p.setBrush(QBrush(diamond_color))
+                p.setBrush(QBrush(marker_color))
+                p.drawPolygon(QPolygon([
+                    QPoint(bx - s, pt),
+                    QPoint(bx + s, pt),
+                    QPoint(bx, pt + s + 3),
+                ]))
 
         p.end()
 
