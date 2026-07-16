@@ -48,7 +48,6 @@ class MainWindow(QMainWindow):
         self.selected_microphone: Any | None = None
 
         self.recorder_service = RecorderService(parent=self)
-        self.recorder_service.recording_error.connect(self.on_recording_error)
         self.recorder_service.recording_finalized.connect(self._on_recording_finalized)
 
         self.screen_selector: ScreenSelectorWidget | None = None
@@ -250,19 +249,6 @@ class MainWindow(QMainWindow):
             return
 
         self._show_annotation_page(session)
-
-    def on_recording_error(self, message: str) -> None:
-        """
-        Handles an error that occurred during recording.
-        :param message: The error message.
-        """
-        if self.record_button_widget is not None:
-            self.record_button_widget.stop_recording()
-
-        self._show_warning(
-            title="Recording Error",
-            message=message,
-        )
 
     def _has_valid_selection(self) -> bool:
         """

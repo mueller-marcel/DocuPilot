@@ -11,7 +11,7 @@ class FeatureTimelineWidget(QWidget):
 
     It draws exactly what it is handed and derives nothing. Everything on screen
     is fed in through a setter:
-      set_data                — the feature curve(s) from feature_extraction
+      set_curve               — the evidence curve from feature_extraction
       set_detected_boundaries — the boundaries feature_extraction determined
       set_boundaries          — the annotated ground truth (from the session)
       set_events              — input-event markers
@@ -25,52 +25,47 @@ class FeatureTimelineWidget(QWidget):
 
     seek_requested = Signal(float)
 
-    DEFAULT_EVENT_COLOR = "#38bdf8"
+    EVENT_COLOR = "#38bdf8"
 
     _PAD_L = 52
     _PAD_R = 16
     _PAD_T = 16
     _PAD_B = 32
 
-    def __init__(
-        self,
-        parent: QWidget | None = None,
-        *,
-        event_color: str = DEFAULT_EVENT_COLOR,
-    ) -> None:
+    def __init__(self, parent: QWidget | None = None) -> None:
         """
         Initialize the timeline widget.
 
         :param parent: Parent widget.
-        :param event_color: Hex color used for event marker dots.
         :return: None
         """
         super().__init__(parent)
-        self._tracks: list[tuple[str, list[float], str, bool]] = []
+        self._curve: list[float] = []
+        self._curve_color: str = "#a78bfa"
         self._duration_ms: float = 0.0
         self._cursor_ms: float = 0.0
         self._boundaries: list[float] = []
         self._events: list[tuple[float, str]] = []
-        self._event_color = event_color
-        # Determined boundaries (GUI and NLI lanes): timestamps in ms, one per
-        # detected boundary, drawn as a single prominent marker each. Replaces
-        # the old two-layer scheme (a dashed line at every judged onset plus a
-        # mid-height diamond at every flag), which buried the result under the
-        # candidates.
+        # Determined boundaries: timestamps in ms, one per detected boundary,
+        # drawn as a single prominent marker each. Replaces the old two-layer
+        # scheme (a dashed line at every judged onset plus a mid-height diamond at
+        # every flag), which buried the result under the candidates.
         self._detected_boundaries: list[float] = []
         self.setMinimumHeight(160)
         self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
         self.setCursor(Qt.CursorShape.CrossCursor)
 
-    def set_data(self, tracks: list[tuple[str, list[float], str, bool]], duration_ms: float) -> None:
+    def set_curve(self, values: list[float], hex_color: str, duration_ms: float) -> None:
         """
-        Load feature tracks to display.
+        Load the evidence curve to display. Pass an empty list to clear it.
 
-        :param tracks: List of (label, normalised_values, hex_color, fill).
+        :param values: Curve values, already normalised to [0, 1].
+        :param hex_color: Curve colour; the area under it is filled translucently.
         :param duration_ms: Total recording duration in milliseconds.
         :return: None
         """
-        self._tracks = tracks
+        self._curve = values
+        self._curve_color = hex_color
         self._duration_ms = duration_ms
         self.update()
 
@@ -161,7 +156,7 @@ class FeatureTimelineWidget(QWidget):
         :param _event: The paint event.
         :return: None
         """
-        if not self._tracks and not self._events:
+        if not self._curve and not self._events:
             self._paint_empty()
             return
 
@@ -215,25 +210,22 @@ class FeatureTimelineWidget(QWidget):
                 p.setPen(boundary_pen)
                 p.drawLine(bx, pt, bx, pt + plot_h)
 
-        for _label, values, hex_color, do_fill in self._tracks:
-            n = len(values)
-            if n < 2:
-                continue
+        n = len(self._curve)
+        if n >= 2:
             xs = [pl + int(i / (n - 1) * plot_w) for i in range(n)]
-            ys = [pt + plot_h - int(v * plot_h) for v in values]
+            ys = [pt + plot_h - int(v * plot_h) for v in self._curve]
 
-            if do_fill:
-                fill_color = QColor(hex_color)
-                fill_color.setAlpha(35)
-                poly_points = [QPoint(xs[0], pt + plot_h)]
-                for x, y in zip(xs, ys):
-                    poly_points.append(QPoint(x, y))
-                poly_points.append(QPoint(xs[-1], pt + plot_h))
-                p.setBrush(QBrush(fill_color))
-                p.setPen(Qt.PenStyle.NoPen)
-                p.drawPolygon(QPolygon(poly_points))
+            fill_color = QColor(self._curve_color)
+            fill_color.setAlpha(35)
+            poly_points = [QPoint(xs[0], pt + plot_h)]
+            for x, y in zip(xs, ys):
+                poly_points.append(QPoint(x, y))
+            poly_points.append(QPoint(xs[-1], pt + plot_h))
+            p.setBrush(QBrush(fill_color))
+            p.setPen(Qt.PenStyle.NoPen)
+            p.drawPolygon(QPolygon(poly_points))
 
-            curve_pen = QPen(QColor(hex_color))
+            curve_pen = QPen(QColor(self._curve_color))
             curve_pen.setWidth(2)
             p.setPen(curve_pen)
             p.setBrush(Qt.BrushStyle.NoBrush)
@@ -248,11 +240,11 @@ class FeatureTimelineWidget(QWidget):
             p.drawLine(cx, pt, cx, pt + plot_h)
 
         if self._duration_ms > 0 and self._events:
-            is_event_only_lane = not self._tracks
-            marker_y = pt + plot_h / 2 if is_event_only_lane else pt + 6
-            radius = 4 if is_event_only_lane else 3
+            no_curve = not self._curve
+            marker_y = pt + plot_h / 2 if no_curve else pt + 6
+            radius = 4 if no_curve else 3
             p.setPen(Qt.PenStyle.NoPen)
-            p.setBrush(QBrush(QColor(self._event_color)))
+            p.setBrush(QBrush(QColor(self.EVENT_COLOR)))
             for ev_ms, _ev_type in self._events:
                 ex = pl + int(ev_ms / self._duration_ms * plot_w)
                 p.drawEllipse(int(ex - radius), int(marker_y - radius), radius * 2, radius * 2)
@@ -291,5 +283,5 @@ class FeatureTimelineWidget(QWidget):
         p.fillRect(0, 0, self.width(), self.height(), QColor("#1e1e2e"))
         p.setPen(QColor("#555"))
         p.setFont(QFont("sans-serif", 11))
-        p.drawText(self.rect(), Qt.AlignmentFlag.AlignCenter, "Keine Audio-Daten verfügbar")
+        p.drawText(self.rect(), Qt.AlignmentFlag.AlignCenter, "Keine Daten verfügbar")
         p.end()

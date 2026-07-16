@@ -226,10 +226,10 @@ def _key_str(key) -> str:
 
 
 class RecorderService(QObject):
-    recording_started    = Signal(object)
-    recording_stopped    = Signal(object)
-    recording_error      = Signal(str)
-    recording_finalized  = Signal(object)
+    # ffmpeg keeps muxing after stop_recording() returns, so the file is only
+    # complete once _finalize joins the process — this signal is what tells the UI
+    # the recording is actually readable.
+    recording_finalized = Signal(object)
 
     def __init__(self, parent: QObject | None = None) -> None:
         super().__init__(parent)
@@ -237,10 +237,6 @@ class RecorderService(QObject):
         self._writer:  EventWriter      | None = None
         self._av:      AvRecorder       | None = None
         self._input:   InputRecorder    | None = None
-
-    @property
-    def current_session(self) -> RecordingSession | None:
-        return self._session
 
     def is_recording(self) -> bool:
         return self._session is not None
@@ -271,7 +267,6 @@ class RecorderService(QObject):
                 },
                 t_ms=session.session_time_ms(),
             )
-            self.recording_started.emit(session)
             return session
 
         except Exception:
@@ -300,7 +295,6 @@ class RecorderService(QObject):
                 },
                 t_ms=session.session_time_ms(),
             )
-            self.recording_stopped.emit(session)
             return session
 
         finally:

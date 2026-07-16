@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 from collections.abc import Callable
+from dataclasses import dataclass
 from pathlib import Path
 
 import numpy as np
@@ -12,8 +13,40 @@ from docupilot.recording.session import RecordingSession
 # At sr=22050 (librosa default): 512 samples ≈ 23 ms per frame.
 _HOP_LENGTH = 512
 
+# At or above this probability a modality commits to a boundary. One threshold,
+# applied once per modality, inside the extractor that owns the evidence.
+_BOUNDARY_THRESHOLD = 0.5
+
 
 # ── Shared module-level helpers ───────────────────────────────────────────────
+
+@dataclass(frozen=True)
+class BoundaryEvidence:
+    """
+    One modality's answer to "where are the action boundaries?".
+
+    `score` over `times_s` is the graded evidence curve — for display, and the
+    raw material any later analysis would aggregate. `boundaries_s` is what the
+    modality actually commits to.
+
+    Each extractor derives its own boundaries, because only it knows what its
+    curve MEANS. A GUI verdict is a spike at the frame the screen settled on; an
+    audio verdict is a wide bump over an announced step, whose peak is the
+    estimate. Reading boundaries off both with one rule gave two different ad-hoc
+    rules in the UI and a threshold constant hand-copied between two files.
+    """
+    times_s: np.ndarray          # (T,) float64 — timestamp per sample
+    score: np.ndarray            # (T,) float32 — graded evidence in [0, 1]
+    boundaries_s: list[float]
+
+    @classmethod
+    def empty(cls) -> "BoundaryEvidence":
+        return cls(
+            times_s=np.zeros(0, dtype=np.float64),
+            score=np.zeros(0, dtype=np.float32),
+            boundaries_s=[],
+        )
+
 
 def _read_events(events_path: Path) -> list[dict]:
     try:
@@ -25,39 +58,23 @@ def _read_events(events_path: Path) -> list[dict]:
 
 
 def _apply_gaussian(
-    features: np.ndarray,
-    col: int,
+    score: np.ndarray,
     center: int,
-    score: float,
-    spread_lo: int,
-    spread_hi: int,
+    value: float,
+    spread: int,
 ) -> None:
     """
-    Write a (potentially asymmetric) Gaussian evidence peak into features[:, col].
+    Write a symmetric Gaussian evidence peak into `score`, centred on `center`.
 
-    For symmetric spread: spread_lo == spread_hi.
     Uses np.maximum so overlapping peaks don't cancel — only the stronger wins.
     """
-    n = features.shape[0]
-
-    if spread_lo > 0 and center > 0:
-        lo = max(0, center - spread_lo)
-        offsets = np.arange(lo, center) - center
-        g = np.exp(-0.5 * (offsets / max(spread_lo / 2.0, 1.0)) ** 2)
-        features[lo:center, col] = np.maximum(
-            features[lo:center, col], (score * g).astype(np.float32)
-        )
-
-    if 0 <= center < n:
-        features[center, col] = max(features[center, col], np.float32(score))
-
-    if spread_hi > 0 and center + 1 < n:
-        hi = min(n, center + spread_hi + 1)
-        offsets = np.arange(center + 1, hi) - center
-        g = np.exp(-0.5 * (offsets / max(spread_hi / 2.0, 1.0)) ** 2)
-        features[center + 1:hi, col] = np.maximum(
-            features[center + 1:hi, col], (score * g).astype(np.float32)
-        )
+    n = len(score)
+    if not (0 <= center < n):
+        return
+    lo, hi = max(0, center - spread), min(n, center + spread + 1)
+    offsets = np.arange(lo, hi) - center
+    g = np.exp(-0.5 * (offsets / max(spread / 2.0, 1.0)) ** 2)
+    score[lo:hi] = np.maximum(score[lo:hi], (value * g).astype(np.float32))
 
 
 # ── GUI Action Boundary Extractor ─────────────────────────────────────────────
@@ -129,20 +146,13 @@ def _apply_gaussian(
 #   - A structural fallback. Without the VLM this extractor has nothing to say,
 #     and a lane full of magnitude peaks reads as evidence when it is noise. It
 #     raises instead.
-#
-# Output (T_v, 3), unchanged for dataset_builder and FeatureDialog:
-#   col 0 — onset_flag:  1.0 at each judged settle frame
-#   col 1 — score:       graded P(action) in [0, 1], Gaussian-spread
-#   col 2 — flag:        0/1 at threshold (DISPLAY ONLY; dataset_builder uses
-#                        col 1 — thresholding happens once, downstream, for every
-#                        modality alike, which is the Shapley prerequisite)
 
 _PHASH_SIZE    = 8
 _ACTIVITY_GRID = 8
 
 # Swept on session_07 against its eight video-derived actions, keeping the
-# cheapest setting at FULL recall (every action proposed within the +-1 s
-# labeling tolerance of dataset_builder):
+# cheapest setting at FULL recall (every action proposed within +-1 s of its
+# annotated boundary):
 #
 #   grid 2 (== the old full+halves signal): NO setting ever reaches 8/8
 #   grid 8, quiet 0.05, dwell 0.3 s: 65 proposals, 8/8
@@ -164,13 +174,7 @@ _SETTLE_OFFSET_S = 0.2
 # the box only has to point, not to decide.
 _PIXEL_CHANGE_EPS = 1.0
 
-# At or above this probability the system is taken to REST in a new established
-# state, and later dwells are compared against it. This selects the reference
-# frame; it is not a boundary decision — col 1 keeps the graded score either way.
-_ANCHOR_ADVANCE = 0.5
-
-_SPREAD_S       = 1.0
-_FLAG_THRESHOLD = 0.5
+_SPREAD_S = 1.0
 
 # A pathological recording (constant flicker) could fragment into thousands of
 # dwells. Anchoring is sequential, so the budget is spent from the start.
@@ -181,8 +185,8 @@ class GUIActionBoundaryExtractor:
     """
     Graded GUI action-boundary evidence, from the video file only.
 
-    pHash tile activity -> dwell segmentation -> a local VLM judges each
-    (anchor, dwell) pair of settled states. Requires a reachable Ollama server;
+    pHash tile activity -> dwell segmentation -> a VLM judges each
+    (anchor, dwell) pair of settled states. Requires a reachable VLM backend;
     there is no structural fallback, because measuring how much the screen
     changed does not answer whether a new state was reached.
     """
@@ -353,15 +357,15 @@ class GUIActionBoundaryExtractor:
     # ── Extraction ────────────────────────────────────────────────────
 
     @staticmethod
-    def extract_gui_features(
+    def extract(
         recording_session: RecordingSession,
         fps: float,
         use_cache: bool = True,
         on_progress: Callable[[int, int], None] | None = None,
         is_cancelled: Callable[[], bool] | None = None,
-    ) -> np.ndarray:
+    ) -> BoundaryEvidence:
         """
-        Graded action-boundary evidence for one recording.
+        Action boundaries for one recording, from the video file alone.
 
         On a CPU-only machine each state pair costs the VLM ~80 s, and a typical
         recording has dozens — so this runs for minutes and MUST NOT be called on
@@ -374,8 +378,7 @@ class GUIActionBoundaryExtractor:
         :param on_progress: called as (judged_pairs, total_pairs) after each pair.
         :param is_cancelled: polled before each pair; return True to stop early
             (the evidence gathered so far is kept and returned).
-        :return: (T_v, 3) float32 — onset flag, graded score, display flag.
-        :raises RuntimeError: when no Ollama server with the model is reachable.
+        :raises RuntimeError: when no VLM backend is reachable.
         """
         from docupilot.segmentation import gui_state_scoring as vlm
 
@@ -399,15 +402,17 @@ class GUIActionBoundaryExtractor:
 
         video_path = str(recording_session.recording_path)
         hashes, activity = GUIActionBoundaryExtractor._scan(video_path)
-        features = np.zeros((len(hashes), 3), dtype=np.float32)
+        times_s = np.arange(len(hashes), dtype=np.float64) / fps
+        score = np.zeros(len(hashes), dtype=np.float32)
+        boundaries_s: list[float] = []
         if len(hashes) < 2:
-            return features
+            return BoundaryEvidence(times_s, score, boundaries_s)
 
         dwells = GUIActionBoundaryExtractor._dwells(
             activity, max(1, round(_MIN_DWELL_S * fps))
         )
         if len(dwells) < 2:
-            return features
+            return BoundaryEvidence(times_s, score, boundaries_s)
 
         # One settled frame per dwell, sampled _SETTLE_OFFSET_S in and downscaled
         # on read. The model sees them stitched into a BEFORE|AFTER composite.
@@ -422,7 +427,6 @@ class GUIActionBoundaryExtractor:
 
         anchor: int | None = None
         calls = 0
-        total = max(0, len(dwells) - 1)               # upper bound on VLM calls
         spread = max(1, int(_SPREAD_S * fps))
 
         for (dwell_start, _), frame_idx in zip(dwells, settled):
@@ -449,22 +453,23 @@ class GUIActionBoundaryExtractor:
             judgement = vlm.judge(composite, cache=cache)
             calls += 1
             if on_progress is not None:
-                on_progress(calls, total)
+                on_progress(calls, max(1, len(dwells) - 1))
             if judgement is None:                    # unusable answer: leave no
                 continue                             # evidence rather than guess
 
-            features[dwell_start, 0] = 1.0
-            _apply_gaussian(
-                features, 1, dwell_start, judgement.p_boundary, spread, spread
-            )
-            if judgement.p_boundary >= _ANCHOR_ADVANCE:
-                anchor = frame_idx                   # a new state is established
+            _apply_gaussian(score, dwell_start, judgement.p_boundary, spread)
+            if judgement.p_boundary >= _BOUNDARY_THRESHOLD:
+                # Accepting the boundary and advancing the anchor are ONE decision:
+                # if a new state was established, later dwells must be judged
+                # against it. The boundary is the settle frame, not the peak of the
+                # spread — the spread only exists to make the curve readable.
+                boundaries_s.append(float(times_s[dwell_start]))
+                anchor = frame_idx
 
         if cache is not None:
             cache.flush()                            # also on cancel: keep what we paid for
 
-        features[:, 2] = (features[:, 1] >= _FLAG_THRESHOLD).astype(np.float32)
-        return features
+        return BoundaryEvidence(times_s, score, boundaries_s)
 
 
 # ── Transcription Extractor ───────────────────────────────────────────────────
@@ -614,27 +619,19 @@ class SentenceSegmenter:
 #     0 at t_{i+1}      by the next announcement the step is demonstrably done
 #
 #   The zeros at the announcements are not cosmetic — they keep adjacent windows
-#   from fusing into one plateau, so find_peaks in dataset_builder yields one
-#   candidate per announced step instead of one candidate per run of them.
+#   from fusing into one plateau, so each announced step yields ONE peak instead
+#   of one peak per run of steps.
 #
 # DELIBERATELY ABSENT — do not reintroduce:
 #   - A narrow peak on the sentence onset. The old stage put a 1.5 s spread on the
-#     announcement; it covered 1 of 7 boundaries, so the ±1 s feature window of
-#     dataset_builder saw nothing and audio's Shapley value measured the geometry
-#     rather than the modality.
+#     announcement; it covered 1 of 7 boundaries, so audio evidence never even
+#     reached the boundary it was supposed to mark.
 #   - Any prosodic/RMS "pause detector" as a boundary source. A pause marks that
 #     the user stopped talking, not that the screen settled; it fires on thinking,
 #     reading and breathing alike.
 #   - A fallback when the LLM is unavailable. Without a per-sentence judgement
 #     every window is equal, the lane tiles the whole timeline, and a uniform lane
 #     reads as evidence while carrying none. It raises instead.
-#
-# Output (T_a, 3):
-#   col 0 — sentence_start: 1.0 at each sentence-start frame
-#   col 1 — score:          graded window evidence in [0, 1]
-#   col 2 — flag:           0/1 at threshold (DISPLAY ONLY; dataset_builder uses
-#                           col 1 — thresholding happens once, downstream, for
-#                           every modality alike, which is the Shapley prerequisite)
 
 # Where in its window does the completion sit? Derived from the definition's own
 # structure, not fitted: executing takes a variable and often long time (rule A
@@ -655,28 +652,29 @@ _COMPLETION_POSITION = 0.75
 # and there is no gap to take a median of.
 _LAST_WINDOW_FALLBACK_S = 8.0
 
-_AUDIO_FLAG_THRESHOLD = 0.5
-
 
 def _apply_window(
-    features: np.ndarray,
-    col: int,
+    score: np.ndarray,
     lo: int,
     hi: int,
     peak: int,
-    score: float,
-) -> None:
+    value: float,
+) -> int:
     """
-    Write a raised-cosine bump over [lo, hi] peaking at `peak`, scaled by `score`.
+    Write a raised-cosine bump over [lo, hi] peaking at `peak`, scaled by `value`.
 
-    Zero at both edges, `score` at the peak, asymmetric when the peak is off
+    Zero at both edges, `value` at the peak, asymmetric when the peak is off
     centre. np.maximum so overlapping windows don't cancel — only the stronger
     wins, same rule as _apply_gaussian.
+
+    :return: the clamped peak index — the window can be cut short by the end of
+        the recording, and the caller needs the index that was actually written,
+        not the one it asked for.
     """
-    n = features.shape[0]
+    n = len(score)
     lo, hi = max(0, lo), min(n - 1, hi)
-    if hi <= lo or score <= 0.0:
-        return
+    if hi <= lo or value <= 0.0:
+        return min(max(peak, 0), max(n - 1, 0))
     peak = min(max(peak, lo), hi)
 
     x = np.arange(lo, hi + 1, dtype=np.float64)
@@ -692,9 +690,10 @@ def _apply_window(
     if hi > peak:
         shape[fall] = 0.5 * (1.0 + np.cos(np.pi * (x[fall] - peak) / (hi - peak)))
 
-    features[lo:hi + 1, col] = np.maximum(
-        features[lo:hi + 1, col], (score * shape).astype(np.float32)
+    score[lo:hi + 1] = np.maximum(
+        score[lo:hi + 1], (value * shape).astype(np.float32)
     )
+    return peak
 
 
 class AudioBoundaryExtractor:
@@ -710,20 +709,19 @@ class AudioBoundaryExtractor:
     """
 
     @staticmethod
-    def extract_audio_features(
+    def extract(
         recording_session: RecordingSession,
         full_text: str,
         words: list[dict],
         n_frames: int,
         sampling_rate: float,
         use_cache: bool = True,
-    ) -> np.ndarray:
+    ) -> BoundaryEvidence:
         """
-        Graded boundary evidence for one recording, on the audio hop grid.
+        Action boundaries for one recording, from the audio track alone.
 
-        Transcription happens in the caller: both call sites need the transcript
-        anyway, and Whisper is by far the slowest step — keeping it outside lets
-        the UI report it as its own phase.
+        Transcription happens in the caller, because Whisper is by far the slowest
+        step and the UI wants to report it as its own phase.
 
         :param recording_session: session; used ONLY for the verdict cache path.
         :param full_text: Whisper transcript.
@@ -731,14 +729,18 @@ class AudioBoundaryExtractor:
         :param n_frames: length of the audio hop grid.
         :param sampling_rate: audio sampling rate (hop grid = sr / _HOP_LENGTH).
         :param use_cache: reuse verdicts cached in the session directory.
-        :return: (T_a, 3) float32 — sentence-start flag, graded score, display flag.
         :raises RuntimeError: when no LLM is reachable.
         """
         from docupilot.segmentation import audio_boundary_scoring as llm
 
-        features = np.zeros((n_frames, 3), dtype=np.float32)
-        if not full_text or not words or n_frames <= 0:
-            return features
+        if n_frames <= 0:
+            return BoundaryEvidence.empty()
+
+        frames_per_second = sampling_rate / _HOP_LENGTH
+        times_s = np.arange(n_frames, dtype=np.float64) / frames_per_second
+        score = np.zeros(n_frames, dtype=np.float32)
+        if not full_text or not words:
+            return BoundaryEvidence(times_s, score, [])
 
         # Checked before spaCy is loaded: the lg model costs seconds, and there is
         # nothing this extractor can deliver without the judge anyway.
@@ -754,17 +756,7 @@ class AudioBoundaryExtractor:
 
         sentences = SentenceSegmenter.segment(full_text, words)
         if not sentences:
-            return features
-
-        frames_per_second = sampling_rate / _HOP_LENGTH
-        starts_s = [t_ms / 1000.0 for t_ms, _ in sentences]
-
-        # Column 0 — sentence onsets. Pure structure, no judgement: this is the
-        # one thing audio observes directly.
-        for t_s in starts_s:
-            idx = int(round(t_s * frames_per_second))
-            if 0 <= idx < n_frames:
-                features[idx, 0] = 1.0
+            return BoundaryEvidence(times_s, score, [])
 
         cache = (
             llm.Cache(recording_session.session_dir / "audio_llm_cache.json")
@@ -774,58 +766,72 @@ class AudioBoundaryExtractor:
         if cache is not None:
             cache.flush()
         if judgements is None:                   # unusable answer: leave no
-            return features                      # evidence rather than guess
+            return BoundaryEvidence(times_s, score, [])   # evidence, don't guess
 
         # The last window has no closing announcement. Two things close it anyway:
-        # this session's own median announcement gap, and the end of the
-        # recording — the step demonstrably finished before the user stopped
-        # recording. Whichever comes first wins.
-        #
-        # Clamping to the recording end is not cosmetic. A window running past the
-        # last frame puts its peak ON the array edge, and find_peaks (which
-        # generates the candidates in dataset_builder) cannot detect an edge
-        # maximum because there is no descent after it. The last boundary of every
-        # session would then be missing from the audio candidate set — a
-        # systematic hole in exactly the arm whose contribution we are measuring.
+        # this session's own median announcement gap, and the end of the recording
+        # — the step demonstrably finished before the user stopped recording.
+        # Whichever comes first wins, which also keeps the peak estimate inside the
+        # recording instead of extrapolating past its end.
+        starts_s = [t_ms / 1000.0 for t_ms, _ in sentences]
         gaps = np.diff(starts_s)
         horizon = float(np.median(gaps)) if len(gaps) else _LAST_WINDOW_FALLBACK_S
         duration_s = (n_frames - 1) / frames_per_second
         window_ends = [*starts_s[1:], min(starts_s[-1] + horizon, duration_s)]
 
+        boundaries_s: list[float] = []
         for t_s, end_s, judgement in zip(starts_s, window_ends, judgements):
             if end_s <= t_s:                     # spaCy split, same Whisper word
                 continue
-            lo = int(round(t_s * frames_per_second))
-            hi = int(round(end_s * frames_per_second))
-            peak = int(round(
-                (t_s + _COMPLETION_POSITION * (end_s - t_s)) * frames_per_second
-            ))
-            _apply_window(features, 1, lo, hi, peak, judgement.p_boundary)
+            peak = _apply_window(
+                score,
+                lo=int(round(t_s * frames_per_second)),
+                hi=int(round(end_s * frames_per_second)),
+                peak=int(round(
+                    (t_s + _COMPLETION_POSITION * (end_s - t_s)) * frames_per_second
+                )),
+                value=judgement.p_boundary,
+            )
+            if judgement.p_boundary >= _BOUNDARY_THRESHOLD:
+                # The boundary is the window's PEAK, not its start: audio expects
+                # the completion inside the announced step, not at the announcement
+                # that opens it.
+                boundaries_s.append(float(times_s[peak]))
 
-        features[:, 2] = (features[:, 1] >= _AUDIO_FLAG_THRESHOLD).astype(np.float32)
-        return features
+        return BoundaryEvidence(times_s, score, boundaries_s)
 
 
-# ── Event Feature Extractor ───────────────────────────────────────────────────
+# ── Event Boundary Extractor ──────────────────────────────────────────────────
+#
+# Graded action-boundary evidence from events.json ALONE — no screen, no audio,
+# so the events modality stays independent for the 2^3 Shapley ablation.
+#
+# WHAT EVENTS CAN AND CANNOT KNOW
+#   Events see the TRIGGER, never the result. A click is recorded whether it
+#   applied a filter or opened a menu, so this modality cannot tell a goal from a
+#   means (rule C) and cannot see a delayed result arrive at all (rule A's build/
+#   filter exception is invisible to it). What it does see is the RHYTHM of input:
+#   a step ends where the user stops typing and clicking, and the next one starts
+#   with a different kind of input somewhere else.
+#
+#   So the evidence is deliberately crude — an idle gap plus a change of input
+#   category. That is the honest ceiling of what a keystroke log knows about a
+#   boundary, and pretending otherwise would fake the quantity the ablation
+#   measures.
 
-_EVENT_WINDOW_S           = 0.25
-_MAX_EVENT_RECENCY_S      = 5.0
+_EVENT_GRID_HZ            = 20.0   # evidence sampling grid; events have no frames
 _EVENT_IDLE_FULL_S        = 3.0
 _EVENT_SPREAD_S           = 1.0
-_EVENT_BOUNDARY_THRESHOLD = 0.5
 _EVENT_IDLE_WEIGHT        = 0.7
 _EVENT_TYPE_CHANGE_WEIGHT = 0.3
 
 
-class EventFeatureExtractor:
+class EventBoundaryExtractor:
     """
-    Extracts event-based features and boundary evidence from events.json.
+    Graded action-boundary evidence, from the event log only.
 
-    extract_event_features  — per-frame descriptive features (count, recency,
-                               type flags); interface and semantics unchanged.
-    extract_event_boundary_evidence — boundary evidence in the same (n, 3)
-                               format as the GUI and semantic extractors.
-    extract_event_markers   — (t_ms, type) list for the FeatureDialog timeline.
+    extract         — boundary evidence, same contract as the other two extractors.
+    extract_markers — (t_ms, type) list of raw input events, for the timeline.
     """
 
     _MARKER_EVENT_TYPES = {"mouse_click", "key_press", "key_release", "mouse_scroll"}
@@ -838,90 +844,52 @@ class EventFeatureExtractor:
     }
 
     @staticmethod
-    def extract_event_markers(recording_session: RecordingSession) -> list[tuple[float, str]]:
+    def extract_markers(recording_session: RecordingSession) -> list[tuple[float, str]]:
         events = _read_events(recording_session.events_path)
         markers = [
             (float(ev.get("t_ms", 0.0)), str(ev.get("type", "")))
             for ev in events
-            if ev.get("type") in EventFeatureExtractor._MARKER_EVENT_TYPES
+            if ev.get("type") in EventBoundaryExtractor._MARKER_EVENT_TYPES
         ]
         markers.sort(key=lambda m: m[0])
         return markers
 
     @staticmethod
-    def extract_event_features(
+    def extract(
         recording_session: RecordingSession,
-        frame_times_ms: np.ndarray,
-    ) -> np.ndarray:
-        markers = EventFeatureExtractor.extract_event_markers(recording_session)
-        n_frames = len(frame_times_ms)
-        features = np.zeros((n_frames, 5), dtype=np.float32)
-
-        if not markers:
-            features[:, 1] = _MAX_EVENT_RECENCY_S
-            return features
-
-        marker_times_s = np.array([t_ms / 1000.0 for t_ms, _ in markers], dtype=np.float64)
-        marker_types   = [ev_type for _, ev_type in markers]
-
-        for i, t_ms in enumerate(frame_times_ms):
-            t_s = float(t_ms) / 1000.0
-            lo = int(np.searchsorted(marker_times_s, t_s - _EVENT_WINDOW_S, side="left"))
-            hi = int(np.searchsorted(marker_times_s, t_s + _EVENT_WINDOW_S, side="right"))
-            types_in_window = marker_types[lo:hi]
-
-            features[i, 0] = hi - lo
-            features[i, 2] = float(any(t == "mouse_click"                 for t in types_in_window))
-            features[i, 3] = float(any(t in ("key_press", "key_release")  for t in types_in_window))
-            features[i, 4] = float(any(t == "mouse_scroll"                for t in types_in_window))
-
-            past_idx = int(np.searchsorted(marker_times_s, t_s, side="right")) - 1
-            features[i, 1] = (
-                min(t_s - marker_times_s[past_idx], _MAX_EVENT_RECENCY_S)
-                if past_idx >= 0 else _MAX_EVENT_RECENCY_S
-            )
-
-        return features
-
-    @staticmethod
-    def extract_event_boundary_evidence(
-        recording_session: RecordingSession,
-        frame_times_ms: np.ndarray,
-    ) -> np.ndarray:
+        duration_s: float,
+    ) -> BoundaryEvidence:
         """
-        Boundary evidence from the event stream, in the same (n, 3) format
-        as GUIActionBoundaryExtractor and AudioBoundaryExtractor.
+        Action boundaries for one recording, from the event log alone.
 
         Evidence model for each event e_i with preceding gap g_i:
           idle_component = min(g_i / _EVENT_IDLE_FULL_S, 1)   in [0, 1]
           type_component = 1 if input category changed vs. previous event
           score(e_i)     = 0.7 * idle + 0.3 * type_change
 
-        The very first event gets idle_component = 1.0 (the workflow's
-        first step necessarily starts there).
+        The very first event gets idle_component = 1.0 (the workflow's first step
+        necessarily starts there).
 
-        Output columns:
-          Col 0 — onset_flag:     1.0 at frames containing a scored event
-          Col 1 — boundary_score: graded evidence [0, 1], Gaussian spread
-          Col 2 — boundary_flag:  hard 0/1 at threshold (display only)
+        :param recording_session: session whose .events_path points at events.json.
+        :param duration_s: recording length; the evidence grid spans it at
+            _EVENT_GRID_HZ.
         """
-        markers  = EventFeatureExtractor.extract_event_markers(recording_session)
-        n_frames = len(frame_times_ms)
-        features = np.zeros((n_frames, 3), dtype=np.float32)
+        markers = EventBoundaryExtractor.extract_markers(recording_session)
+        n_frames = max(0, int(round(duration_s * _EVENT_GRID_HZ)))
         if not markers or n_frames == 0:
-            return features
+            return BoundaryEvidence.empty()
 
-        frame_times_s = np.asarray(frame_times_ms, dtype=np.float64) / 1000.0
-        duration_s = float(frame_times_s[-1] - frame_times_s[0])
-        fps    = (n_frames - 1) / duration_s if duration_s > 0 else 1.0
-        spread = max(1, int(_EVENT_SPREAD_S * fps))
+        times_s = np.arange(n_frames, dtype=np.float64) / _EVENT_GRID_HZ
+        score = np.zeros(n_frames, dtype=np.float32)
+        spread = max(1, int(_EVENT_SPREAD_S * _EVENT_GRID_HZ))
 
+        boundaries_s: list[float] = []
         prev_t_s: float | None = None
-        prev_cat: str | None   = None
+        prev_cat: str | None = None
 
         for t_ms, ev_type in markers:
             t_s = t_ms / 1000.0
-            cat = EventFeatureExtractor._TYPE_CATEGORY.get(ev_type, "other")
+            cat = EventBoundaryExtractor._TYPE_CATEGORY.get(ev_type, "other")
 
             if prev_t_s is None:
                 idle_component = 1.0
@@ -929,15 +897,15 @@ class EventFeatureExtractor:
             else:
                 idle_component = min((t_s - prev_t_s) / _EVENT_IDLE_FULL_S, 1.0)
                 type_component = 1.0 if cat != prev_cat else 0.0
+            value = (_EVENT_IDLE_WEIGHT * idle_component
+                     + _EVENT_TYPE_CHANGE_WEIGHT * type_component)
 
-            score = _EVENT_IDLE_WEIGHT * idle_component + _EVENT_TYPE_CHANGE_WEIGHT * type_component
-
-            center = min(max(int(np.searchsorted(frame_times_s, t_s)), 0), n_frames - 1)
-            features[center, 0] = 1.0
-            _apply_gaussian(features, 1, center, score, spread, spread)
+            center = min(max(int(round(t_s * _EVENT_GRID_HZ)), 0), n_frames - 1)
+            _apply_gaussian(score, center, value, spread)
+            if value >= _BOUNDARY_THRESHOLD:
+                boundaries_s.append(float(times_s[center]))
 
             prev_t_s = t_s
             prev_cat = cat
 
-        features[:, 2] = (features[:, 1] >= _EVENT_BOUNDARY_THRESHOLD).astype(np.float32)
-        return features
+        return BoundaryEvidence(times_s, score, boundaries_s)

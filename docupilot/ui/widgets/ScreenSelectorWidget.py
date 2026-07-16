@@ -30,13 +30,6 @@ class ScreenSelectorWidget(DeviceSelectorWidget):
 
         self.device_selected.connect(self.screen_selected.emit)
 
-    def reload_screens(self) -> None:
-        """
-        Reload the available screens.
-        """
-
-        self.reload_devices()
-
     def get_selected_screen(self):
         """
         Get the selected screen and return it.

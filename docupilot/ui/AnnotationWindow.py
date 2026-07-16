@@ -193,7 +193,9 @@ class AnnotationWindow(QWidget):
 
         self._features_button = QPushButton("♪  Features")
         self._features_button.setCursor(Qt.CursorShape.PointingHandCursor)
-        self._features_button.setToolTip("Energieverlauf der Stimme auf Zeitleiste anzeigen")
+        self._features_button.setToolTip(
+            "Erkannte Handlungsgrenzen je Modalität auf der Zeitleiste anzeigen"
+        )
         self._features_button.setStyleSheet(
             "QPushButton{background:#e8f0fe;color:#1a6fc4;border:1px solid #c5d8f6;"
             "border-radius:5px;font-size:12px;font-weight:600;padding:0 12px;}"
@@ -393,14 +395,10 @@ class AnnotationWindow(QWidget):
             self._feature_dialog.close()
             self._feature_dialog = None
 
-        from docupilot.segmentation.feature_extraction import EventFeatureExtractor
-
-        event_markers = EventFeatureExtractor.extract_event_markers(self._session)
         self._feature_dialog = FeatureDialog(
             player=self._player,
             session=self._session,
             duration_ms=self._duration_ms,
-            event_markers=event_markers,
             parent=self,
         )
         self._feature_dialog.show()
