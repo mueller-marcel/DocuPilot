@@ -7,25 +7,8 @@ from PySide6.QtWidgets import QSizePolicy, QWidget
 
 class FeatureTimelineWidget(QWidget):
     """
-    Reusable timeline lane — a pure VIEW.
-
-    It draws exactly what it is handed and derives nothing. Everything on screen
-    is fed in through a setter:
-      set_curve               — a modality's evidence curve, with its timestamps
-      set_detected_boundaries — the boundaries that modality committed to
-      set_boundaries          — the annotated ground truth (from the session)
-      set_events              — input-event markers
-      set_cursor / set_duration — playback state
-
-    No thresholding, peak picking, smoothing or normalisation happens here: those
-    are decisions, and they belong to the modality that owns the evidence. The
-    widget maps value → pixel and time → pixel, nothing more. Curve values are
-    expected already normalised to [0, 1].
-
-    The curve is positioned by its TIMESTAMPS, not by index. The modalities
-    sample on different grids and their curves do not all end at the same second;
-    stretching each one across the full width would silently shift every lane by
-    its own error.
+    Reusable timeline lane — a pure VIEW: it maps value → pixel and time → pixel
+    and derives nothing. Curve values must already be normalised to [0, 1].
     """
 
     seek_requested = Signal(float)
@@ -52,10 +35,6 @@ class FeatureTimelineWidget(QWidget):
         self._cursor_ms: float = 0.0
         self._boundaries: list[float] = []
         self._events: list[tuple[float, str]] = []
-        # Determined boundaries: timestamps in ms, one per detected boundary,
-        # drawn as a single prominent marker each. Replaces the old two-layer
-        # scheme (a dashed line at every judged onset plus a mid-height diamond at
-        # every flag), which buried the result under the candidates.
         self._detected_boundaries: list[float] = []
         self.setMinimumHeight(160)
         self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
@@ -77,17 +56,8 @@ class FeatureTimelineWidget(QWidget):
 
     def set_duration(self, duration_ms: float) -> None:
         """
-        Update the total recording duration without touching loaded tracks,
-        boundaries, or events.
-
-        Wird benötigt, weil die tatsächliche Dauer manchmal erst NACH
-        set_data()/set_boundaries()/set_events() bekannt wird (z. B. wenn
-        der Media-Player die Dauer noch nicht ermittelt hatte, als der
-        Dialog aufgebaut wurde). Ohne diese Methode bliebe self._duration_ms
-        dauerhaft auf dem ursprünglichen — möglicherweise 0 — Wert stehen,
-        und JEDE Marker-Zeichnung (Grenzen, Events, Cursor, Semantik-Marker)
-        ist an "self._duration_ms > 0" gekoppelt und würde für immer
-        unsichtbar bleiben.
+        Update the total duration without touching curve, boundaries or events —
+        the player often only knows it after the lane was built.
 
         :param duration_ms: Die aktuelle, korrekte Gesamtdauer in Millisekunden.
         :return: None
@@ -129,11 +99,8 @@ class FeatureTimelineWidget(QWidget):
 
     def set_detected_boundaries(self, boundaries_ms: list[float]) -> None:
         """
-        Set the boundaries the model determined for this lane.
-
-        Each is drawn as one prominent marker (a solid line capped with a
-        triangle). Distinct from set_boundaries(), which holds the annotated
-        ground truth.
+        Set the boundaries this modality committed to. Distinct from
+        set_boundaries(), which holds the annotated ground truth.
 
         :param boundaries_ms: Boundary timestamps in milliseconds.
         :return: None
@@ -259,10 +226,7 @@ class FeatureTimelineWidget(QWidget):
                 ex = pl + int(ev_ms / self._duration_ms * plot_w)
                 p.drawEllipse(int(ex - radius), int(marker_y - radius), radius * 2, radius * 2)
 
-        # ── Determined boundaries: one prominent marker each ──────────────────
-        # A solid vertical line capped with a triangle at the top edge. Fuchsia,
-        # so it stays distinct from the curve (lane colour), the ground-truth
-        # boundaries (dashed dark orange) and the playback cursor (white).
+        # Fuchsia, to stay distinct from the curve, the ground truth and the cursor.
         if self._duration_ms > 0 and self._detected_boundaries:
             marker_color = QColor("#f0abfc")
             line_pen = QPen(marker_color)

@@ -44,14 +44,7 @@ _LANES: dict[str, dict[str, str]] = {
 
 
 class _FeatureWorker(QObject):
-    """
-    Runs segmentation OFF the UI thread and turns its callbacks into signals.
-
-    This is not a nicety: Whisper takes minutes and the video modality sends one
-    request per settled-state pair, so segmenting on the UI thread would freeze
-    the dialog for the better part of an hour. The worker knows nothing about how
-    segmentation works — it forwards.
-    """
+    """Runs segmentation OFF the UI thread and turns its callbacks into signals."""
 
     lane_ready  = Signal(str, object)   # (modality, BoundaryEvidence)
     lane_failed = Signal(str, str)      # (modality, message)
@@ -80,17 +73,11 @@ class _FeatureWorker(QObject):
 
 class FeatureDialog(QDialog):
     """
-    Non-modal dialog with one timeline lane per modality, plus a ground-truth lane.
+    Non-modal dialog with one timeline lane per modality, plus a ground-truth lane
+    that appears only when boundaries were annotated.
 
-    A pure view: it starts segmentation on a worker thread and draws whatever
-    comes back. It does not know that video needs a frame rate or that audio needs
-    a transcript — every boundary decision was made in the segmentation package by
-    the modality that owns the evidence.
-
-    Ground-Truth-Grenzen kommen ausschließlich aus session.ground_truth_markers()
-    — dieselbe Quelle für die gestrichelten Linien in allen Lanes und für die
-    Ground-Truth-Lane, damit die beiden nicht auseinanderlaufen können. Die Lane
-    erscheint nur, wenn mindestens eine Grenze gesetzt wurde.
+    A pure view: it starts segmentation on a worker thread and draws what comes
+    back. Every boundary decision was made in the segmentation package.
     """
 
     def __init__(
@@ -177,8 +164,7 @@ class FeatureDialog(QDialog):
             self._lanes[modality] = self._add_lane(
                 lane["section"], lane["label"], lane["color"], height=180
             )
-        # Raw input markers are a JSON parse, so the dots are on screen before the
-        # worker starts; the events lane's evidence curve arrives with the rest.
+        # A JSON parse, so the dots are up before the worker starts.
         self._lanes["events"].set_events(
             [(float(e.get("t_ms", 0.0)), str(e.get("type", "")))
              for e in self._session.input_events()]
@@ -288,10 +274,8 @@ class FeatureDialog(QDialog):
 
     def _set_duration(self, duration_ms: float) -> None:
         """
-        Push a newly known duration to every lane.
-
-        The player only knows it once it has probed the file, and every marker is
-        drawn relative to it — a lane left at 0 stays blank forever.
+        Push a newly known duration to every lane. Every marker is drawn relative
+        to it, so a lane left at 0 stays blank forever.
         """
         if duration_ms <= 0 or duration_ms == self._duration_ms:
             return
@@ -315,12 +299,8 @@ class FeatureDialog(QDialog):
 
     def closeEvent(self, event) -> None:
         """
-        Stop the cursor timer and the worker before closing.
-
-        Without this the worker would keep judging state pairs long after the
-        dialog is gone — minutes of a model running for a window nobody is looking
-        at. Verdicts already paid for stay in the cache, so a cancelled run is not
-        wasted: reopening resumes from there.
+        Stop the cursor timer and the worker before closing, or it would keep
+        paying for verdicts nobody is looking at. Cached verdicts survive.
         """
         self._timer.stop()
         if self._worker is not None:

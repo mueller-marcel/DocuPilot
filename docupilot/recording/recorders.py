@@ -105,11 +105,8 @@ class AvRecorder:
                 if remaining_ns > 0:
                     time.sleep(remaining_ns / 1e9)
 
-    # The mouse cursor is deliberately NOT drawn into the frames. mss does not
-    # capture it, and painting it in would (a) inject the event stream into the
-    # video modality — the two must stay independent for the Shapley ablation —
-    # and (b) make every settled frame differ from the next by a moving arrow,
-    # which is exactly the noise the pHash dwell detection has to see through.
+    # The cursor is deliberately NOT painted into the frames: it would inject the
+    # event stream into the video modality, which must stay independent.
 
     @staticmethod
     def _finalize(proc: subprocess.Popen, on_done=None) -> None:

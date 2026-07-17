@@ -1,29 +1,8 @@
 """
-LLM judgement on narration sentences — the audio modality's semantic stage.
+The audio modality's semantic stage: an LLM decides, per narrated sentence,
+whether it announces an operation (a boundary) or only a means.
 
-The participant narrates every step aloud ("Kommentiere laut, was du gerade
-tust"). This module decides, per narrated sentence, whether it announces an
-operation whose COMPLETION is a boundary under our definition (see
-docs/annotationsleitfaden.md), or whether it is only a means / filler.
-
-WHY AN LLM AND NOT THE OLD ZERO-SHOT NLI:
-  The previous stage asked an mDeBERTa NLI model "is this sentence an action
-  instruction?". Measured on real narration (session_30, 10 sentences), four
-  different hypothesis wordings ALL failed to separate boundary-steps from
-  non-boundary steps — separation was negative in every case ("Navigiere zu den
-  Verkaufsdaten zurück" scored higher than "Ich füge die Tabelle ein"). The
-  reason is structural: the participant announces EVERY step, so "is this an
-  action?" has no variance — the classifier answers a question that is always
-  yes. What actually has to be decided is our definition's distinction (an
-  operation that completes in a new persistent state vs. a means), and that
-  needs a model that can apply a definition.
-
-  It also keeps the Shapley comparison fair: the video modality is judged by a
-  modern VLM. Pairing it with a weak 2021 NLI model on the audio side would make
-  the decomposition measure classifier quality, not modality information.
-
-THIS MODULE READS THE TRANSCRIPT ONLY — never the screen, never the event
-stream. The audio modality has to stay independent for the 2^3 ablation.
+Reads the transcript only — see the docs (Segmentierung) for the rationale.
 """
 
 from __future__ import annotations
@@ -40,13 +19,8 @@ import numpy as np
 MODEL = os.environ.get("DOCUPILOT_AUDIO_MODEL", "claude-opus-4-8")
 
 # Bump when the prompt or the score mapping changes — invalidates cached verdicts.
-#
-# a2: removed the example sentences. a1's examples were lifted, three of them
-#     VERBATIM, from the narration of the session the extractor was being
-#     evaluated on ("Navigiere zu den Verkaufsdaten zurück", "Nun kopiere ich die
-#     Tabelle", "Ich füge die Tabelle ein"). The prompt was handing the model the
-#     answers to its own test set, so a1's verdicts prove nothing about
-#     generalisation. The prompt now carries the definition and nothing else.
+# a2: dropped the example sentences; a1's were lifted from the session under
+#     evaluation, so its verdicts prove nothing about generalisation.
 PROMPT_VERSION = "a2"
 
 _BOUNDARY = "OPERATION"
@@ -56,9 +30,8 @@ _CATEGORIES = (
     "OTHER",     # filler, commentary, verification — announces nothing
 )
 
-# The prompt below is the annotation guideline (docs/annotationsleitfaden.md)
-# restated for narration, and NOTHING ELSE. It deliberately carries no example
-# sentences: see PROMPT_VERSION for what happened when it did.
+# The annotation guideline restated for narration, and nothing else. No example
+# sentences on purpose — see PROMPT_VERSION.
 _SYSTEM = """\
 You are given the spoken narration of a person working through a task in desktop
 software, transcribed and split into sentences, in order. They were told to say
@@ -200,11 +173,8 @@ def ask(sentences: list[str], model: str = MODEL) -> str:
 
 def parse(raw: str, n: int) -> list[Judgement] | None:
     """
-    Turn the model's answer into one graded judgement per sentence.
-
-    P(boundary) is the confidence when the verdict is OPERATION and its
-    complement otherwise — a verdict plus a confidence IS a probability over the
-    boundary question, which is what the Random Forest downstream needs.
+    Turn the model's answer into one graded judgement per sentence: P(boundary)
+    is the confidence for OPERATION and its complement otherwise.
     """
     match = re.search(r"\{.*\}", raw, re.DOTALL)
     if not match:
@@ -284,10 +254,7 @@ def judge(sentences: list[str], cache: Cache | None = None,
           model: str = MODEL) -> list[Judgement] | None:
     """
     Judge every narrated sentence, reusing a cached verdict set when there is one.
-
-    Transport and API failures are NOT swallowed — they would otherwise fail every
-    sentence identically and hand back an empty lane that looks like "no
-    boundaries found".
+    Transport failures are not swallowed — an empty lane would look like a result.
     """
     if not sentences:
         return []

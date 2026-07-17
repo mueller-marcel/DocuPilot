@@ -28,6 +28,7 @@ docupilot = "docupilot.app:run"
 [dependency-groups]
 dev = [
     "ruff>=0.15,<0.16",
+    "sphinx>=9.1,<10.0",
 ]
 
 [build-system]

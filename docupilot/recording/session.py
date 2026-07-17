@@ -25,21 +25,15 @@ class Microphone(Protocol):
     def description(self) -> str: ...
 
 
-# The event types InputRecorder writes for actual user input, as opposed to the
-# recorder's own lifecycle events. Private: callers ask for input_events() rather
-# than filtering the log themselves, so this stays one fact in one place.
+# User input, as opposed to the recorder's own lifecycle events. Private —
+# callers ask for input_events() instead of filtering the log themselves.
 _INPUT_EVENT_TYPES = frozenset(
     {"mouse_click", "key_press", "key_release", "mouse_scroll"}
 )
 
 
-# ── Stub-Implementierungen für das Öffnen gespeicherter Sessions ──────────────
-#
-# Beim Öffnen einer bereits aufgezeichneten Session (Datei > Öffnen) steht
-# kein echtes Screen- und kein echtes Microphone-Objekt zur Verfügung, weil
-# keine neue Aufnahme gestartet wird. Diese Stubs erfüllen die jeweiligen
-# Protocols mit Dummy-Werten (Liskov-konform), damit RecordingSession ohne
-# Sonderfälle konstruiert werden kann.
+# Beim Öffnen einer gespeicherten Session gibt es keine echte Hardware. Diese
+# Stubs erfüllen die Protocols, damit RecordingSession ohne Sonderfälle baut.
 
 class _NullScreenGeometry:
     def x(self) -> int:              return 0
@@ -59,19 +53,10 @@ class _NullMicrophone:
 @dataclass
 class RecordingSession:
     """
-    Represents a recording session that involves screen and microphone capturing.
+    Eine Aufnahme: Dateipfade, Metadaten, gemeinsame Uhr und Ground Truth.
 
-    This class is used to manage all aspects of a recording session, including file
-    paths, metadata generation, and session timing. It handles initialization of
-    session directories and maintains information relevant to both the screen and
-    microphone used during the session.
-
-    RecordingSession ist die EINZIGE Quelle der Wahrheit für Ground-Truth-
-    Grenzen (ground_truth_data): egal ob eine Session gerade live aufgezeichnet
-    oder über from_directory() von der Platte geöffnet wurde, jede Stelle im
-    Code (AnnotationWindow, FeatureDialog, ein zukünftiger Export) liest und
-    schreibt über dieselben Methoden hier — es gibt keine zweite, parallele
-    Ablage mehr.
+    Einzige Quelle der Wahrheit für ground_truth_data — live aufgezeichnet oder
+    über from_directory() geladen, gelesen und geschrieben wird nur hier.
     """
 
     screen:     Screen
@@ -103,14 +88,8 @@ class RecordingSession:
     @classmethod
     def from_directory(cls, directory: Path) -> "RecordingSession":
         """
-        Rekonstruiert eine RecordingSession aus einem bestehenden Verzeichnis.
-
-        Wird über "Datei > Öffnen" verwendet, um eine bereits aufgezeichnete
-        Session zu laden, ohne eine neue Aufnahme zu starten. Screen und
-        Microphone werden durch Stub-Objekte ersetzt, da diese Hardware beim
-        Öffnen nicht verfügbar bzw. nicht relevant ist. Eine vorhandene
-        ground_truth.json wird automatisch geladen; fehlt sie, bleibt
-        ground_truth_data einfach leer.
+        Rekonstruiert eine Session aus einem Verzeichnis ("Datei > Öffnen").
+        Screen und Mikrofon werden durch Stubs ersetzt.
 
         :param directory: Pfad zum Session-Verzeichnis (muss recording.mp4
             und events.json enthalten; ground_truth.json ist optional).
@@ -136,10 +115,8 @@ class RecordingSession:
 
     def read_events(self) -> list[dict[str, Any]]:
         """
-        The raw event log, or an empty list when it is missing or unreadable.
-
-        Not cached: the log is written during recording, so a session that is
-        still running would hand out a stale snapshot.
+        The raw event log, or an empty list when missing. Not cached — a running
+        session would otherwise hand out a stale snapshot.
 
         :return: Events as written by EventWriter, in file order.
         """
@@ -160,17 +137,8 @@ class RecordingSession:
 
     def load_ground_truth(self) -> None:
         """
-        (Re-)Lädt ground_truth.json aus session_dir, sofern vorhanden, und
-        aktualisiert ground_truth_data entsprechend.
-
-        Ist die Datei nicht vorhanden oder ungültig, bleibt ground_truth_data
-        eine leere Liste — Ground Truth ist grundsätzlich optional und darf
-        das Öffnen einer Session nicht verhindern.
-
-        Diese Methode ist beliebig oft aufrufbar (idempotent) und wird sowohl
-        beim Öffnen einer Session von der Platte als auch beim erneuten
-        Anzeigen einer laufenden Session genutzt, damit beide Wege exakt das
-        gleiche Verhalten zeigen.
+        (Re-)Lädt ground_truth.json, sofern vorhanden. Idempotent; fehlt oder
+        bricht die Datei, bleibt ground_truth_data leer — sie ist optional.
 
         :return: None
         """
@@ -196,12 +164,8 @@ class RecordingSession:
 
     def add_ground_truth_boundary(self, t_ms: float, label: str | None = None) -> None:
         """
-        Fügt eine neue Ground-Truth-Grenze hinzu und speichert sofort.
-
-        Zentralisiert das Anlegen einer Grenze an einer Stelle, damit
-        AnnotationWindow nicht selbst eine JSON-Datei schreiben muss und
-        das Schema (t_ms, label, created_at_utc) an genau einem Ort gepflegt
-        wird.
+        Fügt eine Ground-Truth-Grenze hinzu und speichert sofort. Hält das Schema
+        (t_ms, label, created_at_utc) an einem Ort.
 
         :param t_ms: Zeitpunkt der Grenze in Millisekunden.
         :param label: Anzeigename der Grenze, z. B. ein formatierter Zeitstempel.
@@ -216,8 +180,7 @@ class RecordingSession:
 
     def set_ground_truth_boundaries(self, boundaries: list[dict[str, Any]]) -> None:
         """
-        Ersetzt alle Ground-Truth-Grenzen (z. B. nach Löschen im
-        Grenzen-Dialog) und speichert sofort.
+        Ersetzt alle Ground-Truth-Grenzen und speichert sofort.
 
         :param boundaries: Die neue, vollständige Liste der Grenzen.
         :return: None
@@ -227,13 +190,8 @@ class RecordingSession:
 
     def ground_truth_markers(self) -> list[tuple[float, str]]:
         """
-        Wandelt ground_truth_data in (t_ms, label)-Tupel um, wie sie von
-        FeatureTimelineWidget.set_events() erwartet werden.
-
-        Diese Umwandlung liegt bewusst hier statt im UI-Code, damit jede
-        Stelle, die Ground Truth anzeigen will (FeatureDialog, ein
-        zukünftiger Export, ...), dieselbe Logik wiederverwendet, statt sie
-        zu duplizieren.
+        Wandelt ground_truth_data in (t_ms, label)-Tupel um, wie die Timeline
+        sie erwartet.
 
         :return: Liste von (t_ms, label) Tupeln, chronologisch sortiert.
         """

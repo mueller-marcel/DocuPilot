@@ -1,38 +1,9 @@
 """
-VLM judgement on GUI state transitions — cloud (Claude) or local (Ollama).
+The video modality's semantic stage: given two SETTLED screenshots, a VLM decides
+whether a user-triggered action completed between them. Cloud or local Ollama;
+both see the identical composite, so a gap between them is a result.
 
-Given two SETTLED screenshots — the UI before a change and after it has come to
-rest — a vision-language model answers one question:
-
-    "Eine Handlung ist vom User angestoßen und überführt das System in einen
-     neuen Zustand."  Is this transition such an action?
-
-The distinction that carries the whole method is transient vs. persistent state
-(WorldGUI, arXiv:2502.08047): opening the File menu repaints a lot of pixels but
-leaves the system where it was — it is an affordance the user is still
-navigating. Opening the document IS the state change. No appearance metric can
-tell those apart (the menu changes MORE pixels), which is why the judgement is
-made by a model that answers a question rather than by one that measures a
-distance. ViBR (Feng et al., PACMSE/FSE 2026, arXiv:2604.19905) established the
-operation and the gap: VLM frame-pair comparison reaches F1 0.87 on GUI state
-comparison where SSIM reaches 0.62 and CLIP similarity less.
-
-WHY TWO BACKENDS:
-  The local 7B is at the edge of what this task needs. GUI Knowledge Bench (Shi
-  et al., arXiv:2510.26098) measures exactly this — infer the action from two
-  consecutive screenshots — and reports 50.6 % action-type accuracy for
-  Qwen2.5-VL-7B against ~76 % for the strongest frontier models. Both backends
-  see the IDENTICAL composite image and the identical prompt, so the two runs are
-  directly comparable: the difference measured on the same recording is the
-  model's contribution, and a local-vs-cloud gap is a result, not a confound.
-  Ollama also remains the "no data leaves the machine" option.
-
-Verdicts are cached per frame-pair content and per model, so re-running the
-extractor (every time the FeatureDialog opens) is free, and switching backends
-does not overwrite the other backend's cache.
-
-This module reads pixels only. It never touches audio or the event stream — the
-video modality has to stay independent for the 2^3 Shapley ablation.
+Reads pixels only — see the docs (Segmentierung) for the rationale.
 """
 
 from __future__ import annotations
@@ -51,24 +22,14 @@ import numpy as np
 
 def _load_dotenv() -> None:
     """
-    Read KEY=VALUE lines from a .env in the project root into the environment.
-
-    Windows' `setx` writes to the registry, and a process that was already
-    running — PyCharm, an open terminal — never re-reads it. The result is an
-    app that cannot see a key the user demonstrably set, which is a confusing
-    way to lose an afternoon. A .env file is read at import time, so it works
-    regardless of when the process started.
-
-    Never overwrites a variable that is already set: the real environment wins.
+    Read KEY=VALUE lines from a project-root .env into the environment. Never
+    overwrites an already-set variable: the real environment wins.
     """
-    root = Path(__file__).resolve().parents[2]
-    env_file = root / ".env"
+    env_file = Path(__file__).resolve().parents[2] / ".env"
     if not env_file.exists():
         return
     try:
-        # utf-8-sig, not utf-8: PowerShell's Out-File and Notepad write a BOM,
-        # which would otherwise stick to the first key ("﻿ANTHROPIC_API_KEY")
-        # and make a perfectly correct .env silently do nothing.
+        # utf-8-sig: PowerShell writes a BOM that would stick to the first key.
         for line in env_file.read_text(encoding="utf-8-sig").splitlines():
             line = line.strip()
             if not line or line.startswith("#") or "=" not in line:
@@ -92,19 +53,10 @@ MODEL = CLOUD_MODEL if BACKEND == "anthropic" else OLLAMA_MODEL
 
 # Bump when the prompt or the score mapping changes — invalidates cached verdicts.
 PROMPT_VERSION = "v7"   # v7: goal-vs-means definition + async results (see
-                        # docs/annotationsleitfaden.md); v6: Set-of-Mark box + zoom
+                        # docs/handlungsgrenze.rst); v6: Set-of-Mark box + zoom
 
-# The two frames are stitched into ONE composite image, BEFORE left, AFTER right.
-#
-# This is not cosmetic. Sent as two separate images, Ollama/qwen2.5vl receives
-# both but SWAPS them: given [desktop, excel] it reported "image 1 = Excel,
-# image 2 = a bridge". For a before/after question that is fatal — the direction
-# decides whether a document was opened or closed. In one labelled composite the
-# assignment is stable and correct. ViBR (arXiv:2604.19905) uses the same
-# "dual-view composite image" for exactly this comparison.
-#
-# Each half is downscaled to _HALF_WIDTH: GUI text stays legible, and both
-# latency and vision-token count scale with pixel area.
+# ONE composite image, BEFORE left, AFTER right — not cosmetic: sent as two
+# separate images the model swaps them, which is fatal for a before/after question.
 _HALF_WIDTH = 896
 _BANNER_H = 34
 _GAP = 12
@@ -115,7 +67,7 @@ _CATEGORIES = (
     _BOUNDARY,        # finished RESULT of a user operation, now persistent —
                       # incl. a deliberate view/mode change and delayed async
                       # results (build/test/filter finishing). See the boundary
-                      # definition in docs/annotationsleitfaden.md.
+                      # definition in docs/handlungsgrenze.rst.
     "TRANSIENT_UI",   # overlay/selection, or navigation the user passes through
     "IN_PROGRESS",    # mid-typing, mid-scroll, spinner: the operation is not done
     "NO_CHANGE",      # caret, clock, codec noise
@@ -237,11 +189,8 @@ def is_available(model: str = MODEL) -> bool:
             import anthropic  # noqa: F401
         except ImportError:
             return False
-        # Constructing the client is NOT enough: it succeeds without credentials
-        # and only fails on the first request. That would make the extractor
-        # report "available", then silently produce no evidence at all. Check
-        # that a credential actually resolved — an unset ANTHROPIC_API_KEY does
-        # not mean "none": the SDK also reads an `ant auth login` profile.
+        # Constructing the client is not enough — it succeeds without credentials
+        # and only fails on the first request. Check that one actually resolved.
         try:
             client = _client()
         except Exception:
@@ -253,9 +202,7 @@ def is_available(model: str = MODEL) -> bool:
             tags = json.loads(resp.read())
     except (urllib.error.URLError, OSError, json.JSONDecodeError):
         return False
-    # Exact, not by family: accepting any qwen2.5vl tag would report "available"
-    # when only the 3b is present, and the run would then block on Ollama pulling
-    # 6 GB for the 7b — halfway through, from inside the UI.
+    # Exact, not by family: a wrong tag would block on Ollama pulling 6 GB.
     return model in {m.get("name", "") for m in tags.get("models", [])}
 
 
@@ -278,16 +225,8 @@ def ask(composite: bytes, model: str = MODEL, timeout: float = 600) -> str:
 
 
 def _ask_anthropic(composite: bytes, model: str) -> str:
-    # Adaptive thinking, because the hard part of this task IS the fine-grained
-    # visual comparison — DiffSpot (arXiv:2605.29615) puts the best models at
-    # ~23 % on GUI-level differences, so the model needs room to look properly.
-    # Effort stays low: the OUTPUT is one small JSON object, and this runs once
-    # per settled-state pair across a whole recording.
-    #
-    # max_tokens covers thinking AND the answer. 4000 is deliberate headroom: a
-    # budget that runs out mid-JSON would truncate the answer, parse() would
-    # return None, and the pair would silently get no evidence — a wrong result
-    # dressed as a missing one.
+    # Thinking room for the fine-grained visual comparison; low effort because the
+    # output is one small JSON object. max_tokens covers thinking AND the answer.
     message = _client().messages.create(
         model=model,
         max_tokens=4000,
@@ -406,22 +345,8 @@ def encode_pair(before: np.ndarray, after: np.ndarray,
     """
     Stitch two downscaled frames into one labelled BEFORE|AFTER composite.
 
-    When `region` is given (the tiles whose pHash differs), it is drawn as a box
-    on BOTH halves and a magnified crop of it is appended as a second row:
-
-      +-----------------+-----------------+
-      | BEFORE  [ box ] | AFTER   [ box ] |    full context
-      +-----------------+-----------------+
-      | ZOOM: BEFORE    | ZOOM: AFTER     |    the box, enlarged
-      +-----------------+-----------------+
-
-    The box is Set-of-Mark prompting (Yang et al., arXiv:2310.11441) — marking a
-    region measurably improves what a VLM grounds its answer in. The zoom row is
-    the V*/CropVLM finding (Wu & Xie, CVPR 2024; arXiv:2511.19820): MLLMs simply
-    miss small details in high-resolution images, and this recording's weakest
-    real action (filter arrows appearing) is 0.005 % of the pixels.
-
-    Both are free: one image, one request. Only the picture gets better.
+    `region` is drawn as a box on both halves and appended enlarged as a second
+    row — Set-of-Mark plus zoom, both free: one image, one request.
     """
     import cv2
 
@@ -537,13 +462,8 @@ def judge(composite: bytes, cache: Cache | None = None,
     """
     Score one BEFORE|AFTER composite, reusing a cached verdict when there is one.
 
-    Returns None only when the model ANSWERED but the answer was unusable — that
-    is a verdict about one pair, and the pair simply gets no evidence.
-
-    Transport and API failures are NOT swallowed. The SDK already retries 429s
-    and 5xx; anything that still escapes (exhausted credit, revoked key, dead
-    network) would otherwise fail every single pair identically and hand back an
-    empty lane that LOOKS like "no boundaries found". Let it raise.
+    None means the model answered unusably — that pair gets no evidence. Transport
+    failures are not swallowed: an empty lane would look like a result.
     """
     key = Cache.key(composite, model)
     if cache is not None:

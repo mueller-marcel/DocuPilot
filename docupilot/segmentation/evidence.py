@@ -1,10 +1,8 @@
 """
-What every modality produces, and the two ways of drawing evidence onto a curve.
+What every modality returns, and the two ways of drawing evidence onto a curve.
 
-This module is the segmentation package's shared vocabulary. It knows nothing
-about screens, microphones or keyboards — which is the point: the three modality
-modules must not learn about each other, and a shared type is the only thing they
-are allowed to have in common.
+The shared vocabulary of the segmentation package — deliberately the only thing
+the three modality modules have in common.
 """
 
 from __future__ import annotations
@@ -13,31 +11,19 @@ from dataclasses import dataclass
 
 import numpy as np
 
-# Sampling grid for modalities that have no frames of their own (audio, events).
-# Video uses its own frame rate. The value is arbitrary and only sets the
-# quantisation of a reported boundary (±10 ms here) — orders of magnitude below
-# what any modality can actually resolve.
+# Sampling grid for modalities without frames of their own (audio, events); video
+# uses its own frame rate. Only sets the quantisation of a reported boundary.
 GRID_HZ = 50.0
 
-# At or above this probability a modality commits to a boundary. One threshold,
-# applied once per modality, inside the extractor that owns the evidence.
+# At or above this probability a modality commits to a boundary.
 BOUNDARY_THRESHOLD = 0.5
 
 
 @dataclass(frozen=True)
 class BoundaryEvidence:
     """
-    One modality's answer to "where are the action boundaries?".
-
-    `score` over `times_s` is the graded evidence curve — for display, and the
-    raw material any later analysis aggregates. `boundaries_s` is what the
-    modality actually commits to.
-
-    Each extractor derives its own boundaries, because only it knows what its
-    curve MEANS. A video verdict is a spike at the frame the screen settled on;
-    an audio verdict is a wide bump over an announced step, whose peak is the
-    estimate; an events verdict sits on the last input of a burst. Reading
-    boundaries off all three with one rule needs a rule that fits none of them.
+    One modality's answer to "where are the action boundaries?": a graded curve
+    for display, and the boundaries the modality commits to.
     """
 
     times_s: np.ndarray          # (T,) float64 — timestamp per sample
@@ -59,11 +45,7 @@ def grid(duration_s: float, hz: float = GRID_HZ) -> np.ndarray:
 
 
 def apply_gaussian(score: np.ndarray, center: int, value: float, spread: int) -> None:
-    """
-    Write a symmetric Gaussian peak into `score`, centred on `center`.
-
-    np.maximum so overlapping peaks don't cancel — only the stronger wins.
-    """
+    """Write a symmetric Gaussian peak into `score`; overlapping peaks: max wins."""
     n = len(score)
     if not 0 <= center < n:
         return
@@ -75,14 +57,10 @@ def apply_gaussian(score: np.ndarray, center: int, value: float, spread: int) ->
 
 def apply_window(score: np.ndarray, lo: int, hi: int, peak: int, value: float) -> int:
     """
-    Write a raised-cosine bump over [lo, hi] peaking at `peak`, scaled by `value`.
+    Write a raised-cosine bump over [lo, hi] peaking at `peak`: zero at both
+    edges, `value` at the peak, asymmetric when the peak is off centre.
 
-    Zero at both edges, `value` at the peak, asymmetric when the peak is off
-    centre. np.maximum, same rule as apply_gaussian.
-
-    :return: the clamped peak index — the window can be cut short by the end of
-        the recording, and the caller needs the index that was actually written,
-        not the one it asked for.
+    :return: the clamped peak index, which the recording's end may have moved.
     """
     n = len(score)
     lo, hi = max(0, lo), min(n - 1, hi)
