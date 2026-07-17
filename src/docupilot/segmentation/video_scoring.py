@@ -3,7 +3,7 @@ The video modality's semantic stage: given two SETTLED screenshots, a VLM decide
 whether a user-triggered action completed between them. Cloud or local Ollama;
 both see the identical composite, so a gap between them is a result.
 
-Reads pixels only — see the docs (Segmentierung) for the rationale.
+Reads pixels only, never audio or the event stream.
 """
 
 from __future__ import annotations
@@ -52,8 +52,8 @@ OLLAMA_HOST = os.environ.get("OLLAMA_HOST", "http://localhost:11434")
 MODEL = CLOUD_MODEL if BACKEND == "anthropic" else OLLAMA_MODEL
 
 # Bump when the prompt or the score mapping changes — invalidates cached verdicts.
-PROMPT_VERSION = "v7"   # v7: goal-vs-means definition + async results (see
-                        # docs/handlungsgrenze.rst); v6: Set-of-Mark box + zoom
+PROMPT_VERSION = "v7"   # v7: goal-vs-means definition + async results;
+                        # v6: Set-of-Mark box + zoom
 
 # ONE composite image, BEFORE left, AFTER right — not cosmetic: sent as two
 # separate images the model swaps them, which is fatal for a before/after question.
@@ -66,8 +66,7 @@ _BOUNDARY = "ACTION_COMPLETED"
 _CATEGORIES = (
     _BOUNDARY,        # finished RESULT of a user operation, now persistent —
                       # incl. a deliberate view/mode change and delayed async
-                      # results (build/test/filter finishing). See the boundary
-                      # definition in docs/handlungsgrenze.rst.
+                      # results (build/test/filter finishing)
     "TRANSIENT_UI",   # overlay/selection, or navigation the user passes through
     "IN_PROGRESS",    # mid-typing, mid-scroll, spinner: the operation is not done
     "NO_CHANGE",      # caret, clock, codec noise

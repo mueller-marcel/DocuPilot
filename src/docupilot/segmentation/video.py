@@ -3,7 +3,7 @@ Action boundaries from the screen recording alone: pHash tile activity finds the
 frames where the screen stands still, and a VLM judges each settled state against
 an ANCHOR holding the last established one.
 
-Reads only the video stream — see the docs (Segmentierung) for the rationale.
+Reads only the video stream, so the modality stays independent for the ablation.
 """
 
 from __future__ import annotations

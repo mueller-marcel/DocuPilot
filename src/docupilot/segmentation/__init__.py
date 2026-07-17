@@ -1,6 +1,7 @@
 """
 Find the action boundaries in one recording — one module per modality, and they
-never import each other (see docs/segmentierung.rst).
+never import each other (that independence is what keeps the Shapley ablation
+valid; a single cross-read would make those numbers measure the leak).
 
     evidence.py       what every modality returns, and how a curve gets drawn
     video.py          boundaries from the screen recording alone

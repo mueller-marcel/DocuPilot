@@ -2,7 +2,7 @@
 The audio modality's semantic stage: an LLM decides, per narrated sentence,
 whether it announces an operation (a boundary) or only a means.
 
-Reads the transcript only — see the docs (Segmentierung) for the rationale.
+Reads the transcript only, never the screen or the event stream.
 """
 
 from __future__ import annotations

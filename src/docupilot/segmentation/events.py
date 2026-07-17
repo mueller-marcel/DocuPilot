@@ -1,6 +1,6 @@
 """
 Action boundaries from events.json alone: input bursts, graded by the rest after
-them. Opens exactly one file — see the docs (Segmentierung) for the rationale.
+them. Opens exactly one file, so the modality stays independent for the ablation.
 """
 
 from __future__ import annotations

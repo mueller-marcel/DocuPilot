@@ -2,8 +2,8 @@
 Action boundaries from the audio track alone: each narrated sentence opens an
 execution window filled with a bump scaled by an LLM's verdict on it.
 
-Audio knows the INTERVAL a boundary falls in, never the instant — see
-the docs (Segmentierung) for why, and for what was tried and rejected.
+Audio knows the INTERVAL a boundary falls in, never the instant: the narration
+announces steps in order, so step i completed between announcement i and i+1.
 """
 
 from __future__ import annotations

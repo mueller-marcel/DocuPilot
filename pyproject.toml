@@ -25,10 +25,13 @@ dependencies = [
 [project.scripts]
 docupilot = "docupilot.app:run"
 
+[tool.poetry]
+# src-Layout: das Paket heisst weiter "docupilot", liegt aber unter src/.
+packages = [{ include = "docupilot", from = "src" }]
+
 [dependency-groups]
 dev = [
     "ruff>=0.15,<0.16",
-    "sphinx>=9.1,<10.0",
 ]
 
 [build-system]
