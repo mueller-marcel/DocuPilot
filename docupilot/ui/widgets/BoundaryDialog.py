@@ -12,10 +12,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-
-def format_ms(ms: float) -> str:
-    s = int(ms) // 1000
-    return f"{s // 60:02d}:{s % 60:02d}.{int(ms) % 1000:03d}"
+from docupilot.ui.formatting import format_ms
 
 
 class BoundaryDialog(QDialog):

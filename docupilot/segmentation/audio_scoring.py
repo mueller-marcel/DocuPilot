@@ -40,7 +40,14 @@ import numpy as np
 MODEL = os.environ.get("DOCUPILOT_AUDIO_MODEL", "claude-opus-4-8")
 
 # Bump when the prompt or the score mapping changes — invalidates cached verdicts.
-PROMPT_VERSION = "a1"
+#
+# a2: removed the example sentences. a1's examples were lifted, three of them
+#     VERBATIM, from the narration of the session the extractor was being
+#     evaluated on ("Navigiere zu den Verkaufsdaten zurück", "Nun kopiere ich die
+#     Tabelle", "Ich füge die Tabelle ein"). The prompt was handing the model the
+#     answers to its own test set, so a1's verdicts prove nothing about
+#     generalisation. The prompt now carries the definition and nothing else.
+PROMPT_VERSION = "a2"
 
 _BOUNDARY = "OPERATION"
 _CATEGORIES = (
@@ -49,10 +56,13 @@ _CATEGORIES = (
     "OTHER",     # filler, commentary, verification — announces nothing
 )
 
+# The prompt below is the annotation guideline (docs/annotationsleitfaden.md)
+# restated for narration, and NOTHING ELSE. It deliberately carries no example
+# sentences: see PROMPT_VERSION for what happened when it did.
 _SYSTEM = """\
 You are given the spoken narration of a person working through a task in desktop
 software, transcribed and split into sentences, in order. They were told to say
-each step out loud as they do it.
+each step out loud as they do it. The narration may be in German.
 
 For EACH sentence decide what it announces, using this definition:
 
@@ -63,23 +73,17 @@ Categories:
 
   OPERATION  The sentence announces an operation whose completion is a boundary:
              something is applied, created, entered, deleted, moved, inserted,
-             saved, opened, or a view/mode is deliberately switched to and kept.
-             Examples: "Ich aktiviere den Autofilter", "Ich sortiere nach Menge",
-             "Ich erstelle ein neues Blatt", "Ich füge die Tabelle ein",
-             "Ich wechsle in die Leseansicht".
+             saved or opened, or a view/mode is deliberately switched to and kept
+             because that switch is itself the goal.
 
   MEANS      The sentence announces only a step ON THE WAY to another operation —
-             it changes nothing that persists: navigating or switching to where
-             the next action will happen, scrolling, selecting/marking, copying
-             to the clipboard, opening a menu or dialog.
-             Examples: "Navigiere zu den Verkaufsdaten zurück", "Ich scrolle
-             nach unten", "Ich markiere die Zeilen", "Nun kopiere ich die
-             Tabelle", "Ich öffne das Menü".
+             it leaves nothing that persists: navigating or switching to where
+             the next action will happen, scrolling to bring something into view,
+             selecting or marking, copying to the clipboard, opening a menu or
+             dialog, clicking into a field before typing in it.
 
   OTHER      Announces no step: filler, thinking aloud, commentary on a result,
-             checking or reading something, greetings.
-             Examples: "Das sieht gut aus", "Ähm, moment", "Hier sehen wir 19
-             Datensätze".
+             reading or checking something, greetings.
 
 Judge the sentences IN CONTEXT of the sequence: a sentence is MEANS when the
 sentence that follows it names the operation it was serving.
@@ -130,7 +134,7 @@ class Judgement:
 
 
 def _load_dotenv() -> None:
-    """Read a .env from the project root (see gui_state_scoring for the why)."""
+    """Read a .env from the project root (see video_scoring for the why)."""
     env_file = Path(__file__).resolve().parents[2] / ".env"
     if not env_file.exists():
         return
@@ -189,7 +193,7 @@ def ask(sentences: list[str], model: str = MODEL) -> str:
     if message.stop_reason == "max_tokens":
         raise RuntimeError(
             "Antwort von max_tokens abgeschnitten — max_tokens in "
-            "audio_boundary_scoring.ask erhöhen."
+            "audio_scoring.ask erhöhen."
         )
     return "".join(b.text for b in message.content if b.type == "text")
 

@@ -11,16 +11,21 @@ class FeatureTimelineWidget(QWidget):
 
     It draws exactly what it is handed and derives nothing. Everything on screen
     is fed in through a setter:
-      set_curve               — the evidence curve from feature_extraction
-      set_detected_boundaries — the boundaries feature_extraction determined
+      set_curve               — a modality's evidence curve, with its timestamps
+      set_detected_boundaries — the boundaries that modality committed to
       set_boundaries          — the annotated ground truth (from the session)
       set_events              — input-event markers
       set_cursor / set_duration — playback state
 
-    No thresholding, peak/minimum picking, smoothing or normalisation happens
-    here: that is feature_extraction's job. The widget maps value → pixel and
-    time → pixel, nothing more. Curve values are expected already normalised to
-    [0, 1].
+    No thresholding, peak picking, smoothing or normalisation happens here: those
+    are decisions, and they belong to the modality that owns the evidence. The
+    widget maps value → pixel and time → pixel, nothing more. Curve values are
+    expected already normalised to [0, 1].
+
+    The curve is positioned by its TIMESTAMPS, not by index. The modalities
+    sample on different grids and their curves do not all end at the same second;
+    stretching each one across the full width would silently shift every lane by
+    its own error.
     """
 
     seek_requested = Signal(float)
@@ -41,6 +46,7 @@ class FeatureTimelineWidget(QWidget):
         """
         super().__init__(parent)
         self._curve: list[float] = []
+        self._curve_times_ms: list[float] = []
         self._curve_color: str = "#a78bfa"
         self._duration_ms: float = 0.0
         self._cursor_ms: float = 0.0
@@ -55,18 +61,18 @@ class FeatureTimelineWidget(QWidget):
         self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
         self.setCursor(Qt.CursorShape.CrossCursor)
 
-    def set_curve(self, values: list[float], hex_color: str, duration_ms: float) -> None:
+    def set_curve(self, times_s: list[float], values: list[float], hex_color: str) -> None:
         """
-        Load the evidence curve to display. Pass an empty list to clear it.
+        Load the evidence curve to display. Pass empty lists to clear it.
 
+        :param times_s: Timestamp of each value, in seconds.
         :param values: Curve values, already normalised to [0, 1].
         :param hex_color: Curve colour; the area under it is filled translucently.
-        :param duration_ms: Total recording duration in milliseconds.
         :return: None
         """
+        self._curve_times_ms = [t * 1000.0 for t in times_s]
         self._curve = values
         self._curve_color = hex_color
-        self._duration_ms = duration_ms
         self.update()
 
     def set_duration(self, duration_ms: float) -> None:
@@ -210,16 +216,18 @@ class FeatureTimelineWidget(QWidget):
                 p.setPen(boundary_pen)
                 p.drawLine(bx, pt, bx, pt + plot_h)
 
-        n = len(self._curve)
-        if n >= 2:
-            xs = [pl + int(i / (n - 1) * plot_w) for i in range(n)]
+        if len(self._curve) >= 2 and self._duration_ms > 0:
+            xs = [pl + int(t / self._duration_ms * plot_w) for t in self._curve_times_ms]
             ys = [pt + plot_h - int(v * plot_h) for v in self._curve]
+
+            # A curve may run a little past the recording's end (the modalities
+            # measure their own length); clip instead of painting over the axis.
+            p.setClipRect(pl, pt, plot_w, plot_h)
 
             fill_color = QColor(self._curve_color)
             fill_color.setAlpha(35)
             poly_points = [QPoint(xs[0], pt + plot_h)]
-            for x, y in zip(xs, ys):
-                poly_points.append(QPoint(x, y))
+            poly_points += [QPoint(x, y) for x, y in zip(xs, ys)]
             poly_points.append(QPoint(xs[-1], pt + plot_h))
             p.setBrush(QBrush(fill_color))
             p.setPen(Qt.PenStyle.NoPen)
@@ -229,8 +237,10 @@ class FeatureTimelineWidget(QWidget):
             curve_pen.setWidth(2)
             p.setPen(curve_pen)
             p.setBrush(Qt.BrushStyle.NoBrush)
-            for i in range(n - 1):
+            for i in range(len(xs) - 1):
                 p.drawLine(xs[i], ys[i], xs[i + 1], ys[i + 1])
+
+            p.setClipping(False)
 
         if self._duration_ms > 0:
             cx = pl + int(self._cursor_ms / self._duration_ms * plot_w)

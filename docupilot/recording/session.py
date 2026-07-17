@@ -25,6 +25,14 @@ class Microphone(Protocol):
     def description(self) -> str: ...
 
 
+# The event types InputRecorder writes for actual user input, as opposed to the
+# recorder's own lifecycle events. Private: callers ask for input_events() rather
+# than filtering the log themselves, so this stays one fact in one place.
+_INPUT_EVENT_TYPES = frozenset(
+    {"mouse_click", "key_press", "key_release", "mouse_scroll"}
+)
+
+
 # ── Stub-Implementierungen für das Öffnen gespeicherter Sessions ──────────────
 #
 # Beim Öffnen einer bereits aufgezeichneten Session (Datei > Öffnen) steht
@@ -125,6 +133,30 @@ class RecordingSession:
 
         session.load_ground_truth()
         return session
+
+    def read_events(self) -> list[dict[str, Any]]:
+        """
+        The raw event log, or an empty list when it is missing or unreadable.
+
+        Not cached: the log is written during recording, so a session that is
+        still running would hand out a stale snapshot.
+
+        :return: Events as written by EventWriter, in file order.
+        """
+        try:
+            with self.events_path.open(encoding="utf-8") as fh:
+                data = json.load(fh)
+            return data if isinstance(data, list) else []
+        except (OSError, json.JSONDecodeError):
+            return []
+
+    def input_events(self) -> list[dict[str, Any]]:
+        """
+        Only the user's own input, without the recorder's lifecycle events.
+
+        :return: Clicks, keys and scrolls, in file order.
+        """
+        return [e for e in self.read_events() if e.get("type") in _INPUT_EVENT_TYPES]
 
     def load_ground_truth(self) -> None:
         """

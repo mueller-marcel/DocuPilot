@@ -1,8 +1,5 @@
 from __future__ import annotations
 
-import json
-from pathlib import Path
-
 from PySide6.QtCore import QTimer, QUrl, Qt, Signal
 from PySide6.QtGui import QColor, QPainter
 from PySide6.QtMultimedia import QAudioOutput, QMediaPlayer
@@ -21,17 +18,10 @@ from PySide6.QtWidgets import (
 )
 
 from docupilot.recording.session import RecordingSession
+from docupilot.ui.formatting import format_ms
 from docupilot.ui.widgets.BoundaryDialog import BoundaryDialog
 from docupilot.ui.widgets.EventsPanelWidget import EventsPanelWidget
 from docupilot.ui.widgets.FeatureDialog import FeatureDialog
-
-
-_MARKER_TYPES = {"mouse_click", "key_press", "key_release", "mouse_scroll"}
-
-
-def format_ms(ms: float) -> str:
-    s = int(ms) // 1000
-    return f"{s // 60:02d}:{s % 60:02d}.{int(ms) % 1000:03d}"
 
 
 class _MarkerSlider(QSlider):
@@ -107,7 +97,7 @@ class AnnotationWindow(QWidget):
 
         session.load_ground_truth()
 
-        self._events = self._read_events(session.events_path)
+        self._events = session.read_events()
         self._events_panel.set_events(self._events)
 
         self._player.setSource(QUrl.fromLocalFile(str(session.recording_path)))
@@ -303,11 +293,10 @@ class AnnotationWindow(QWidget):
     def _on_duration_changed(self, duration_ms: int) -> None:
         self._duration_ms = float(duration_ms)
         self._duration_label.setText(format_ms(float(duration_ms)))
-        if self._duration_ms > 0:
+        if self._duration_ms > 0 and self._session is not None:
             fractions = [
                 ev.get("t_ms", 0.0) / self._duration_ms
-                for ev in self._events
-                if ev.get("type") in _MARKER_TYPES
+                for ev in self._session.input_events()
             ]
             self._slider.set_markers(fractions)
 
@@ -409,12 +398,3 @@ class AnnotationWindow(QWidget):
         self._player.stop()
         self._timer.stop()
         self.back_requested.emit()
-
-    @staticmethod
-    def _read_events(path: Path) -> list[dict]:
-        try:
-            with path.open(encoding="utf-8") as fh:
-                data = json.load(fh)
-            return data if isinstance(data, list) else []
-        except (OSError, json.JSONDecodeError):
-            return []

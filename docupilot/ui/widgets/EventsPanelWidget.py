@@ -11,17 +11,7 @@ from PySide6.QtWidgets import (
 )
 
 
-def format_ms(ms: float) -> str:
-    s = int(ms) // 1000
-    return f"{s // 60:02d}:{s % 60:02d}.{int(ms) % 1000:03d}"
-
-
-_PROMINENT_TYPES = {
-    "av_started", "av_stopped",
-    "input_started", "input_stopped",
-    "recording_started", "recording_stopping", "recording_stopped",
-    "mouse_click", "key_press", "key_release", "mouse_scroll",
-}
+from docupilot.ui.formatting import format_ms
 
 _DOT_COLOR: dict[str, str] = {
     "av_started":         "#534AB7",
@@ -33,7 +23,6 @@ _DOT_COLOR: dict[str, str] = {
     "recording_stopped":  "#e24b4a",
     "mouse_click":        "#D85A30",
     "mouse_scroll":       "#D85A30",
-    "mouse_move":         "#aaaaaa",
     "key_press":          "#BA7517",
     "key_release":        "#BA7517",
 }
@@ -49,7 +38,6 @@ class _EventRow(QWidget):
 
         self.event_data = ev
         self._active = False
-        self._prominent = ev.get("type") in _PROMINENT_TYPES
 
         self.setCursor(Qt.CursorShape.PointingHandCursor)
         self.setToolTip(f"Springe zu {format_ms(ev.get('t_ms', 0.0))}")
@@ -65,26 +53,14 @@ class _EventRow(QWidget):
         layout.addWidget(dot)
 
         type_label = QLabel(ev.get("type", "?"))
-        if self._prominent:
-            type_label.setStyleSheet("font-size:12px; font-weight:600; color:#222;")
-        else:
-            type_label.setStyleSheet("font-size:11px; color:#666;")
+        type_label.setStyleSheet("font-size:12px; font-weight:600; color:#222;")
         layout.addWidget(type_label)
 
-        if self._prominent:
-            t = ev.get("type", "")
-            detail = ""
-            if t == "mouse_click":
-                action = "↓" if ev.get("pressed") else "↑"
-                detail = f"{ev.get('button', '').replace('Button.', '')}{action}"
-            elif t in ("key_press", "key_release"):
-                detail = str(ev.get("key", ""))
-            elif t == "mouse_scroll":
-                detail = f"({ev.get('x', '?')},{ev.get('y', '?')})"
-            if detail:
-                detail_label = QLabel(detail)
-                detail_label.setStyleSheet("font-size:11px; color:#888;")
-                layout.addWidget(detail_label)
+        detail = self._detail(ev)
+        if detail:
+            detail_label = QLabel(detail)
+            detail_label.setStyleSheet("font-size:11px; color:#888;")
+            layout.addWidget(detail_label)
 
         layout.addStretch()
 
@@ -94,24 +70,33 @@ class _EventRow(QWidget):
 
         self._update_style(active=False)
 
+    @staticmethod
+    def _detail(ev: dict) -> str:
+        """The one extra field worth showing per event type."""
+        t = ev.get("type", "")
+        if t == "mouse_click":
+            arrow = "↓" if ev.get("pressed") else "↑"
+            return f"{ev.get('button', '').replace('Button.', '')}{arrow}"
+        if t in ("key_press", "key_release"):
+            return str(ev.get("key", ""))
+        if t == "mouse_scroll":
+            return f"({ev.get('x', '?')},{ev.get('y', '?')})"
+        return ""
+
     def mousePressEvent(self, mouse_event) -> None:
         self.jumped.emit(float(self.event_data.get("t_ms", 0.0)))
 
-    def set_active(self, active: bool, past: bool) -> None:
+    def set_active(self, active: bool) -> None:
         if self._active == active:
             return
         self._active = active
-        self._update_style(active=active, past=past)
+        self._update_style(active=active)
 
-    def _update_style(self, *, active: bool, past: bool = False) -> None:
-        if active:
-            self.setStyleSheet(
-                "background:#dbeafe; border-radius:5px;border-left:3px solid #4da3ff;"
-            )
-        elif past and not self._prominent:
-            self.setStyleSheet("background:transparent; border:none; opacity:0.5;")
-        else:
-            self.setStyleSheet("background:transparent; border:none;")
+    def _update_style(self, *, active: bool) -> None:
+        self.setStyleSheet(
+            "background:#dbeafe; border-radius:5px;border-left:3px solid #4da3ff;"
+            if active else "background:transparent; border:none;"
+        )
         self.setProperty("active", active)
 
 
@@ -172,15 +157,11 @@ class EventsPanelWidget(QWidget):
             self._event_rows.append(row)
 
     def highlight(self, pos_ms: float) -> None:
-        tol = self.TOLERANCE_MS
         first_active: _EventRow | None = None
 
         for row in self._event_rows:
-            ev_ms = row.event_data.get("t_ms", 0.0)
-            active = abs(ev_ms - pos_ms) <= tol
-            past = ev_ms < pos_ms - tol
-            row.set_active(active, past)
-
+            active = abs(row.event_data.get("t_ms", 0.0) - pos_ms) <= self.TOLERANCE_MS
+            row.set_active(active)
             if active and first_active is None:
                 first_active = row
 
