@@ -341,6 +341,8 @@ class AnnotationWindow(QWidget):
     def _set_boundary(self) -> None:
         if self._session is None:
             return
+        # The MP4 carries real timestamps, so the player position already is the
+        # common clock the events and video use — no conversion needed.
         pos_ms = float(self._player.position())
         self._session.add_ground_truth_boundary(pos_ms, label=format_ms(pos_ms))
         self._update_boundary_count()

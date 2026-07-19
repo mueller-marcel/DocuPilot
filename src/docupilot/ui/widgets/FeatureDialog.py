@@ -103,8 +103,9 @@ class FeatureDialog(QDialog):
 
         self._player = player
         self._session = session
-        # The player may not have probed the file yet and can still report 0; both
-        # _start_worker and _sync_cursor correct that as soon as it knows.
+        # Player, lanes, extractors and GT share the recording's real timeline
+        # (the MP4 carries real timestamps). The player may still report 0 until it
+        # has probed the file; _sync_cursor corrects that.
         self._duration_ms = float(player.duration()) or duration_ms
 
         self._ground_truth_markers = session.ground_truth_markers()
@@ -275,7 +276,7 @@ class FeatureDialog(QDialog):
     def _set_duration(self, duration_ms: float) -> None:
         """
         Push a newly known duration to every lane. Every marker is drawn relative
-        to it, so a lane left at 0 stays blank forever.
+        to it, so a lane left at 0 stays blank until the player probes the file.
         """
         if duration_ms <= 0 or duration_ms == self._duration_ms:
             return

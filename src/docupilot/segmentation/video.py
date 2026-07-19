@@ -112,6 +112,35 @@ def _fps(video_path: str) -> float:
         cap.release()
 
 
+def _frame_times_s(video_path: str, n_frames: int) -> np.ndarray:
+    """
+    Real capture time of each frame in seconds, read straight from the MP4.
+
+    The recorder encodes with real wall-clock timestamps (VFR), so each frame's
+    presentation time IS the moment it was captured — the same clock the events
+    run on. ffprobe reads those times exactly from the container (unlike OpenCV's
+    POS_MSEC, which some builds derive from an assumed frame rate). The origin is
+    shifted to the first frame so it matches the event clock's zero.
+
+    :raises RuntimeError: when the times cannot be read or do not match the frames.
+    """
+    import subprocess
+
+    out = subprocess.run(
+        ["ffprobe", "-v", "error", "-select_streams", "v:0",
+         "-show_entries", "frame=pts_time", "-of", "csv=p=0", video_path],
+        capture_output=True, text=True,
+    ).stdout
+    times = [float(line.split(",")[0]) for line in out.splitlines() if line.strip()]
+    if len(times) != n_frames:
+        raise RuntimeError(
+            f"ffprobe lieferte {len(times)} Frame-Zeiten, dekodiert wurden "
+            f"{n_frames} — inkonsistente Aufnahme."
+        )
+    t = np.asarray(times, dtype=np.float64)
+    return t - t[0]
+
+
 def _scan(video_path: str) -> tuple[int, np.ndarray]:
     """Stream the video once; return the frame count and the per-frame activity."""
     import cv2
@@ -228,7 +257,7 @@ def extract(
     video_path = str(session.recording_path)
     fps = _fps(video_path)
     n_frames, activity = _scan(video_path)
-    times_s = np.arange(n_frames, dtype=np.float64) / fps
+    times_s = _frame_times_s(video_path, n_frames)
     score = np.zeros(n_frames, dtype=np.float32)
     boundaries_s: list[float] = []
     if n_frames < 2:

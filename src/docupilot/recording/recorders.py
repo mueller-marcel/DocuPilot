@@ -72,7 +72,7 @@ class AvRecorder:
             ).start()
 
     def _capture_loop(self) -> None:
-        interval_ns = int(1_000_000_000 / self._FPS)
+        period = 1.0 / self._FPS
         geo = self._session.screen.geometry()
         region = {
             "left":   geo.x(),
@@ -81,11 +81,12 @@ class AvRecorder:
             "height": geo.height(),
         }
         with mss.mss() as sct:
-            # Arm before the first grab: t_ms=0 is the logical start of frame 0.
-            frame_deadline_ns = time.monotonic_ns()
-            self._session.arm(frame_deadline_ns)
+            # Arm before the first grab: t_ms=0 is the logical start of frame 0,
+            # the same origin ffmpeg's wall-clock timestamps normalise to.
+            self._session.arm(time.monotonic_ns())
 
             while not self._stop.is_set():
+                started = time.monotonic()
                 screenshot = sct.grab(region)
                 bgra = np.frombuffer(screenshot.raw, dtype=np.uint8).reshape(
                     screenshot.height, screenshot.width, 4
@@ -99,11 +100,11 @@ class AvRecorder:
                 except (BrokenPipeError, OSError):
                     break
 
-                # Advance absolute deadline to prevent cumulative drift.
-                frame_deadline_ns += interval_ns
-                remaining_ns = frame_deadline_ns - time.monotonic_ns()
-                if remaining_ns > 0:
-                    time.sleep(remaining_ns / 1e9)
+                # Cap at _FPS; the exact rate is irrelevant because ffmpeg stamps
+                # each frame with the real wall clock, not an assumed rate.
+                idle = period - (time.monotonic() - started)
+                if idle > 0:
+                    time.sleep(idle)
 
     # The cursor is deliberately NOT painted into the frames: it would inject the
     # event stream into the video modality, which must stay independent.
@@ -125,15 +126,18 @@ class AvRecorder:
     def _build_cmd(self) -> list[str]:
         mic = self._session.microphone.description()
         out = str(self._session.recording_path)
-        fps = str(self._FPS)
         sys = platform.system()
 
+        # -use_wallclock_as_timestamps stamps each piped frame with the real time
+        # ffmpeg reads it (NOT an assumed rate), and -fps_mode vfr keeps those
+        # timestamps in the file. The video timeline is then real time — the same
+        # clock the events run on — so the two need no reconciliation afterwards.
         video_in = [
             "-f", "rawvideo",
             "-vcodec", "rawvideo",
             "-pix_fmt", "bgr24",
             "-s", f"{self._w}x{self._h}",
-            "-r", fps,
+            "-use_wallclock_as_timestamps", "1",
             "-i", "pipe:0",
         ]
         codec = [
@@ -141,6 +145,7 @@ class AvRecorder:
             "-preset", "ultrafast",
             "-crf", "28",
             "-pix_fmt", "yuv420p",
+            "-fps_mode", "vfr",
             "-c:a", "aac",
             "-b:a", "128k",
         ]
