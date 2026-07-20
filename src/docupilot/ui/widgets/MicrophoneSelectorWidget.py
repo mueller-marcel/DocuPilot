@@ -31,13 +31,6 @@ class MicrophoneSelectorWidget(DeviceSelectorWidget):
 
         self.device_selected.connect(self.microphone_selected.emit)
 
-    def reload_microphones(self) -> None:
-        """
-        Reload the available microphones.
-        """
-
-        self.reload_devices()
-
     def get_selected_microphone(self):
         """
         Get the selected microphone and return it.

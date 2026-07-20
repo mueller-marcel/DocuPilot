@@ -1,9 +1,12 @@
 from __future__ import annotations
 
+from pathlib import Path
 from typing import Any
 
 from PySide6.QtCore import Qt
+from PySide6.QtGui import QAction, QKeySequence
 from PySide6.QtWidgets import (
+    QFileDialog,
     QLabel,
     QMainWindow,
     QMessageBox,
@@ -31,7 +34,8 @@ class MainWindow(QMainWindow):
     Wires the selector widgets to the RecorderService and uses a QStackedWidget
     to switch between the recorder page and the annotation page. After a
     recording is stopped, the app navigates to the annotation page for the
-    just-finished session.
+    just-finished session. Existing sessions on disk can also be reopened via
+    "Datei > Öffnen".
     """
 
     def __init__(self) -> None:
@@ -44,7 +48,6 @@ class MainWindow(QMainWindow):
         self.selected_microphone: Any | None = None
 
         self.recorder_service = RecorderService(parent=self)
-        self.recorder_service.recording_error.connect(self.on_recording_error)
         self.recorder_service.recording_finalized.connect(self._on_recording_finalized)
 
         self.screen_selector: ScreenSelectorWidget | None = None
@@ -58,6 +61,7 @@ class MainWindow(QMainWindow):
         self._setup_recorder_page()
         self._setup_annotation_page()
         self._setup_waiting_page()
+        self._setup_menu_bar()
 
     def _setup_recorder_page(self) -> None:
         """
@@ -115,6 +119,22 @@ class MainWindow(QMainWindow):
         layout.addWidget(label)
         layout.addStretch()
         self._stack.insertWidget(_PAGE_WAITING, page)
+
+    def _setup_menu_bar(self) -> None:
+        """
+        Erstellt die Menüleiste mit "Datei > Öffnen", um eine bestehende
+        Session (recording.mp4 + events.json, optional ground_truth.json)
+        aus einem Verzeichnis zu laden.
+
+        :return: None
+        """
+
+        file_menu = self.menuBar().addMenu("&Datei")
+
+        open_action = QAction("&Öffnen…", self)
+        open_action.setShortcut(QKeySequence.StandardKey.Open)
+        open_action.triggered.connect(self._on_open_session)
+        file_menu.addAction(open_action)
 
     def _show_recorder_page(self) -> None:
         """
@@ -203,18 +223,32 @@ class MainWindow(QMainWindow):
 
         self._show_annotation_page(session)
 
-    def on_recording_error(self, message: str) -> None:
+    def _on_open_session(self) -> None:
         """
-        Handles an error that occurred during recording.
-        :param message: The error message.
-        """
-        if self.record_button_widget is not None:
-            self.record_button_widget.stop_recording()
+        Öffnet einen Verzeichnis-Dialog und lädt die dort enthaltene Session
+        (recording.mp4, events.json, optional ground_truth.json) über
+        RecordingSession.from_directory(). Bei Erfolg wird direkt die
+        Annotation-Seite mit der geladenen Session angezeigt.
 
-        self._show_warning(
-            title="Recording Error",
-            message=message,
+        :return: None
+        """
+
+        directory = QFileDialog.getExistingDirectory(
+            self, "Session-Verzeichnis öffnen"
         )
+        if not directory:
+            return
+
+        try:
+            session = RecordingSession.from_directory(Path(directory))
+        except FileNotFoundError as exc:
+            self._show_error(
+                title="Session konnte nicht geöffnet werden",
+                message=str(exc),
+            )
+            return
+
+        self._show_annotation_page(session)
 
     def _has_valid_selection(self) -> bool:
         """

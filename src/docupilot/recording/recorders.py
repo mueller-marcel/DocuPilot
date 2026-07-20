@@ -15,44 +15,20 @@ from docupilot.recording.session import EventWriter, Microphone, RecordingSessio
 
 
 class AvRecorder:
-    """
-    Handles audiovisual recording by capturing screen and microphone data simultaneously
-    and encoding them into a video file. Primarily relies on ffmpeg for the audio-visual
-    encoding tasks. Manages threading and subprocess operations for smooth functionality.
-
-    This class ensures efficient capturing and writing of audiovisual content by creating
-    video streams from the screen and audio input from the microphone. It also ensures
-    proper encoding and resource cleanup post-recording lifecycle.
-
-    :ivar _w: Width of the screen's recording area in pixels.
-    :type _w: Int
-    :ivar _h: Height of the screen's recording area in pixels.
-    :type _h: Int
-    """
-
     _FPS = 10
 
-    def __init__(self, session: RecordingSession, writer: EventWriter) -> None:
-        """
-        Initializes the AvRecorder with the given session and writer.
-        :param session: The session object containing screen, microphone and events.
-        :param writer: The event writer to write recording events to.
-        """
+    def __init__(self, session: RecordingSession, writer: EventWriter, on_done=None) -> None:
         self._session = session
         self._writer = writer
+        self._on_done = on_done
         self._proc: subprocess.Popen | None = None
         self._thread: threading.Thread | None = None
         self._stop = threading.Event()
-        self._on_done_callback = None  # set by RecorderService
         geo = session.screen.geometry()
         self._w = geo.width()
         self._h = geo.height()
 
     def start(self) -> None:
-        """
-        Starts the audiovisual recording process by starting the capture loop and
-        """
-
         self._stop.clear()
         self._proc = subprocess.Popen(
             self._build_cmd(),
@@ -61,9 +37,7 @@ class AvRecorder:
             stderr=subprocess.PIPE,
         )
         self._thread = threading.Thread(target=self._capture_loop, daemon=True, name="av-capture")
-
-        if self._thread:
-            self._thread.start()
+        self._thread.start()
 
         deadline = time.monotonic() + 2.0
         while not self._session.is_armed:
@@ -77,10 +51,6 @@ class AvRecorder:
         )
 
     def stop(self) -> None:
-        """
-        Ends the audiovisual recording process by stopping the capture loop
-        """
-
         self._stop.set()
         if self._thread:
             self._thread.join(timeout=5)
@@ -96,57 +66,55 @@ class AvRecorder:
         if proc:
             threading.Thread(
                 target=self._finalize,
-                args=(proc, self._on_done_callback),
+                args=(proc, self._on_done),
                 daemon=False,
                 name="av-finalize",
             ).start()
 
     def _capture_loop(self) -> None:
-        """
-        The loop that captures the screen data
-        """
-
-        interval = 1.0 / self._FPS
+        period = 1.0 / self._FPS
         geo = self._session.screen.geometry()
         region = {
-            "left": geo.x(),
-            "top": geo.y(),
-            "width": geo.width(),
+            "left":   geo.x(),
+            "top":    geo.y(),
+            "width":  geo.width(),
             "height": geo.height(),
         }
-        with mss.MSS() as sct:
+        with mss.mss() as sct:
+            # Arm before the first grab: t_ms=0 is the logical start of frame 0,
+            # the same origin ffmpeg's wall-clock timestamps normalise to.
+            self._session.arm(time.monotonic_ns())
+
             while not self._stop.is_set():
-                t0 = time.monotonic()
-
+                started = time.monotonic()
                 screenshot = sct.grab(region)
-                if not self._session.is_armed:
-                    self._session.arm(time.monotonic_ns())
-
                 bgra = np.frombuffer(screenshot.raw, dtype=np.uint8).reshape(
                     screenshot.height, screenshot.width, 4
                 )
+                bgr = bgra[:, :, :3].copy()
+
                 try:
                     if self._proc and self._proc.stdin:
-                        self._proc.stdin.write(bgra[:, :, :3].tobytes())
+                        self._proc.stdin.write(bgr.tobytes())
                         self._proc.stdin.flush()
                 except (BrokenPipeError, OSError):
                     break
 
-                elapsed = time.monotonic() - t0
-                if elapsed < interval:
-                    time.sleep(interval - elapsed)
+                # Cap at _FPS; the exact rate is irrelevant because ffmpeg stamps
+                # each frame with the real wall clock, not an assumed rate.
+                idle = period - (time.monotonic() - started)
+                if idle > 0:
+                    time.sleep(idle)
+
+    # The cursor is deliberately NOT painted into the frames: it would inject the
+    # event stream into the video modality, which must stay independent.
 
     @staticmethod
     def _finalize(proc: subprocess.Popen, on_done=None) -> None:
-        """
-        Finalizes the audiovisual recording process by closing the stdin pipe and waiting for
-        :param proc: The subprocess object representing the recording process.
-        """
-
         try:
             if proc.stdin:
                 proc.stdin.close()
-            _, stderr = proc.communicate(timeout=30)
+            proc.communicate(timeout=30)
         except subprocess.TimeoutExpired:
             proc.kill()
             proc.communicate()
@@ -156,43 +124,30 @@ class AvRecorder:
             on_done()
 
     def _build_cmd(self) -> list[str]:
-        """
-        Build the command line arguments for the ffmpeg process.
-        :return: A list of strings representing the command line arguments.
-        """
-
         mic = self._session.microphone.description()
         out = str(self._session.recording_path)
-        fps = str(self._FPS)
         sys = platform.system()
 
+        # -use_wallclock_as_timestamps stamps each piped frame with the real time
+        # ffmpeg reads it (NOT an assumed rate), and -fps_mode vfr keeps those
+        # timestamps in the file. The video timeline is then real time — the same
+        # clock the events run on — so the two need no reconciliation afterwards.
         video_in = [
-            "-f",
-            "rawvideo",
-            "-vcodec",
-            "rawvideo",
-            "-pix_fmt",
-            "bgr24",
-            "-s",
-            f"{self._w}x{self._h}",
-            "-r",
-            fps,
-            "-i",
-            "pipe:0",
+            "-f", "rawvideo",
+            "-vcodec", "rawvideo",
+            "-pix_fmt", "bgr24",
+            "-s", f"{self._w}x{self._h}",
+            "-use_wallclock_as_timestamps", "1",
+            "-i", "pipe:0",
         ]
         codec = [
-            "-c:v",
-            "libx264",
-            "-preset",
-            "ultrafast",
-            "-crf",
-            "28",
-            "-pix_fmt",
-            "yuv420p",
-            "-c:a",
-            "aac",
-            "-b:a",
-            "128k",
+            "-c:v", "libx264",
+            "-preset", "ultrafast",
+            "-crf", "28",
+            "-pix_fmt", "yuv420p",
+            "-fps_mode", "vfr",
+            "-c:a", "aac",
+            "-b:a", "128k",
         ]
 
         if sys == "Windows":
@@ -212,28 +167,16 @@ class AvRecorder:
 
 
 class InputRecorder:
-    """
-    Handles the recording of input events such as mouse movements, clicks, scrolls,
-    and keyboard key presses/releases.
-
-    The InputRecorder class is responsible for managing the recording session of user
-    input activities and writing these events using the provided EventWriter. This class
-    uses the pynput library to listen to mouse and keyboard events. Events are logged
-    and throttled to avoid overloading the writer with excessive messages.
-    """
-
-    _THROTTLE_MS = 50.0
-
     def __init__(self, session: RecordingSession, writer: EventWriter) -> None:
         self._session = session
         self._writer = writer
-        self._last_move_t_ms = 0.0
         self._mouse: pynput.mouse.Listener | None = None
         self._keyboard: pynput.keyboard.Listener | None = None
 
     def start(self) -> None:
-        self._last_move_t_ms = 0.0
         self._writer.write({"type": "input_started"}, t_ms=self._session.session_time_ms())
+        # No on_move handler: pointer motion is not an event we record, and the
+        # AvRecorder no longer needs the cursor position (it does not draw it).
         self._mouse = pynput.mouse.Listener(
             on_click=self._on_click,
             on_scroll=self._on_scroll,
@@ -242,10 +185,8 @@ class InputRecorder:
             on_press=self._on_press,
             on_release=self._on_release,
         )
-
-        if self._mouse and self._keyboard:
-            self._mouse.start()
-            self._keyboard.start()
+        self._mouse.start()
+        self._keyboard.start()
 
     def stop(self) -> None:
         if self._mouse:
@@ -287,30 +228,17 @@ def _key_str(key) -> str:
 
 
 class RecorderService(QObject):
-    """
-    Manages the recording process, including starting, stopping, and handling recording sessions.
-
-    The RecorderService class is designed to handle recording sessions by managing associated
-    resources such as screen, microphone, and file writing. It provides signals for observing
-    the recording state and ensures proper cleanup of resources in case of failures or when
-    recording is stopped.
-    """
-
-    recording_started = Signal(object)
-    recording_stopped = Signal(object)
-    recording_error = Signal(str)
-    recording_finalized = Signal(object)  # emitted when ffmpeg has finished writing
+    # ffmpeg keeps muxing after stop_recording() returns, so the file is only
+    # complete once _finalize joins the process — this signal is what tells the UI
+    # the recording is actually readable.
+    recording_finalized = Signal(object)
 
     def __init__(self, parent: QObject | None = None) -> None:
         super().__init__(parent)
         self._session: RecordingSession | None = None
-        self._writer: EventWriter | None = None
-        self._av: AvRecorder | None = None
-        self._input: InputRecorder | None = None
-
-    @property
-    def current_session(self) -> RecordingSession | None:
-        return self._session
+        self._writer:  EventWriter      | None = None
+        self._av:      AvRecorder       | None = None
+        self._input:   InputRecorder    | None = None
 
     def is_recording(self) -> bool:
         return self._session is not None
@@ -325,27 +253,22 @@ class RecorderService(QObject):
 
         try:
             self._writer = EventWriter(session.events_path)
-
-            if self._writer:
-                self._writer.open()
-                self._av = AvRecorder(session, self._writer)
-                self._av._on_done_callback = lambda: self.recording_finalized.emit(session)
-                self._input = InputRecorder(session, self._writer)
-
-            if self._av and self._input:
-                self._av.start()
-                self._input.start()
-
-            if self._writer:
-                self._writer.write(
-                    {
-                        "type": "recording_started",
-                        "timestamp_utc": datetime.now(timezone.utc).isoformat(),
-                        "metadata": session.to_metadata_dict(),
-                    },
-                    t_ms=session.session_time_ms(),
-                )
-            self.recording_started.emit(session)
+            self._writer.open()
+            self._av = AvRecorder(
+                session, self._writer,
+                on_done=lambda: self.recording_finalized.emit(session),
+            )
+            self._input = InputRecorder(session, self._writer)
+            self._av.start()
+            self._input.start()
+            self._writer.write(
+                {
+                    "type": "recording_started",
+                    "timestamp_utc": datetime.now(timezone.utc).isoformat(),
+                    "metadata": session.to_metadata_dict(),
+                },
+                t_ms=session.session_time_ms(),
+            )
             return session
 
         except Exception:
@@ -358,28 +281,22 @@ class RecorderService(QObject):
 
         session = self._session
         try:
-            if self._writer:
-                self._writer.write(
-                    {
-                        "type": "recording_stopping",
-                        "timestamp_utc": datetime.now(timezone.utc).isoformat(),
-                    },
-                    t_ms=session.session_time_ms(),
-                )
-            if self._input:
-                self._input.stop()
-            if self._av:
-                self._av.stop()
-
-            if self._writer:
-                self._writer.write(
-                    {
-                        "type": "recording_stopped",
-                        "timestamp_utc": datetime.now(timezone.utc).isoformat(),
-                    },
-                    t_ms=session.session_time_ms(),
-                )
-            self.recording_stopped.emit(session)
+            self._writer.write(
+                {
+                    "type": "recording_stopping",
+                    "timestamp_utc": datetime.now(timezone.utc).isoformat(),
+                },
+                t_ms=session.session_time_ms(),
+            )
+            self._input.stop()
+            self._av.stop()
+            self._writer.write(
+                {
+                    "type": "recording_stopped",
+                    "timestamp_utc": datetime.now(timezone.utc).isoformat(),
+                },
+                t_ms=session.session_time_ms(),
+            )
             return session
 
         finally:
