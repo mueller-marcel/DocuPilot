@@ -187,7 +187,7 @@ def _read_frames(video_path: str, wanted: set[int]) -> dict[int, np.ndarray]:
     Fetch the given frames in one linear pass, downscaled on read.
 
     Sequential decoding beats seeking on a long-GOP MP4, and full-size frames
-    would hold ~0.5 GB while a local VLM already occupies most of the machine.
+    would hold ~0.5 GB in memory for nothing — the model only sees the downscale.
     """
     import cv2
 
@@ -237,21 +237,12 @@ def extract(
     from docupilot.segmentation import video_scoring as vlm
 
     if not vlm.is_available():
-        hint = (
-            f"Cloud-Backend '{vlm.MODEL}' nicht nutzbar. Benötigt:\n"
-            "  poetry install         (Paket 'anthropic')\n"
-            "  ANTHROPIC_API_KEY=...  oder  ant auth login\n"
-            "Alternativ lokal: DOCUPILOT_VLM=ollama"
-            if vlm.BACKEND == "anthropic" else
-            f"Ollama nicht erreichbar ({vlm.OLLAMA_HOST}) oder Modell "
-            f"'{vlm.MODEL}' fehlt:\n"
-            f"  ollama serve\n"
-            f"  ollama pull {vlm.MODEL}"
-        )
         raise RuntimeError(
-            hint + "\n\nOhne VLM kann die Video-Modalität keine Handlungsgrenzen "
-            "bestimmen — ein rein struktureller Score misst Pixelmenge, nicht "
-            "Bedeutung."
+            f"Cloud-Modell '{vlm.MODEL}' nicht nutzbar. Benötigt:\n"
+            "  poetry install         (Paket 'anthropic')\n"
+            "  ANTHROPIC_API_KEY=...  oder  ant auth login\n\n"
+            "Ohne VLM kann die Video-Modalität keine Handlungsgrenzen bestimmen — "
+            "ein rein struktureller Score misst Pixelmenge, nicht Bedeutung."
         )
 
     video_path = str(session.recording_path)
