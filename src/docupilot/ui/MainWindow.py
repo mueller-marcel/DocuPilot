@@ -18,6 +18,7 @@ from PySide6.QtWidgets import (
 from docupilot.recording.recorders import RecorderService
 from docupilot.recording.session import RecordingSession
 from docupilot.ui.AnnotationWindow import AnnotationWindow
+from docupilot.ui.ExperimentWindow import ExperimentWindow
 from docupilot.ui.widgets.MicrophoneSelectorWidget import MicrophoneSelectorWidget
 from docupilot.ui.widgets.RecordButtonWidget import RecordButtonWidget
 from docupilot.ui.widgets.ScreenSelectorWidget import ScreenSelectorWidget
@@ -54,6 +55,7 @@ class MainWindow(QMainWindow):
         self.microphone_selector: MicrophoneSelectorWidget | None = None
         self.record_button_widget: RecordButtonWidget | None = None
         self.annotation_window: AnnotationWindow | None = None
+        self.experiment_window: ExperimentWindow | None = None
 
         self._stack = QStackedWidget()
         self.setCentralWidget(self._stack)
@@ -135,6 +137,26 @@ class MainWindow(QMainWindow):
         open_action.setShortcut(QKeySequence.StandardKey.Open)
         open_action.triggered.connect(self._on_open_session)
         file_menu.addAction(open_action)
+
+        analysis_menu = self.menuBar().addMenu("&Auswertung")
+
+        experiment_action = QAction("&Informationsbeitrag der Modalitäten…", self)
+        experiment_action.triggered.connect(self._on_open_experiment)
+        analysis_menu.addAction(experiment_action)
+
+    def _on_open_experiment(self) -> None:
+        """
+        Öffnet das Auswertungsfenster für einen ganzen Korpus. Nicht-modal, damit
+        der stundenlange Lauf die restliche Anwendung nicht blockiert.
+
+        :return: None
+        """
+
+        if self.experiment_window is None:
+            self.experiment_window = ExperimentWindow(self)
+        self.experiment_window.show()
+        self.experiment_window.raise_()
+        self.experiment_window.activateWindow()
 
     def _show_recorder_page(self) -> None:
         """

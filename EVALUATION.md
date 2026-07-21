@@ -208,17 +208,21 @@ Dafür werden die F1-Werte **je Session** benötigt (nicht nur die Mittelwerte):
 
 Sind die Differenzen überwiegend gleichgerichtet, liegt ein echter Effekt vor.
 
-| Baustein | Zweck |
-|---|---|
-| Wilcoxon-Vorzeichen-Rang-Test | Sind die Differenzen überwiegend gleichgerichtet? |
-| BCa-Bootstrap | Konfidenzintervall statt Punktschätzer |
-| Holm-Korrektur | Schutz vor Zufallstreffern bei vielen Vergleichen |
-| Sensitivitäts-Poweranalyse (MDE) | Welche Effektgrösse kann n = 25 überhaupt zeigen? |
-| TOST | Nachweis, dass ein Effekt *klein* ist (für TF3) |
-| Intrarater-Reliabilität | Messlatte und empirische Herleitung der Relevanzschwelle |
+| Baustein | Zweck | Status |
+|---|---|---|
+| BCa-Bootstrap über Sessions | Konfidenzintervall statt Punktschätzer | fertig |
+| Sensitivitäts-Poweranalyse (MDE) | Welche Effektgrösse kann n = 25 zeigen? | fertig |
+| erforderliche Fallzahl | quantifiziert, was der Korpus *nicht* kann | fertig |
+| Intrarater-Reliabilität | Messlatte und Herleitung der Relevanzschwelle | offen |
 
-Details werden vor Beginn von Schicht 5 festgelegt und committet, damit
-nachweisbar ist, dass der Analyseplan vor den Ergebnissen feststand.
+**Bewusst weggelassen:** Wilcoxon-Test, Holm-Korrektur und TOST. Ein
+Konfidenzintervall, das die 0 ausschliesst, trifft dieselbe Aussage wie ein
+Signifikanztest — nur informativer, weil es zusätzlich die Effektgrösse nennt.
+Und wer keine formalen Testentscheidungen trifft, braucht keine Korrektur für
+multiples Testen. Das hält die Auswertung klein, ohne die Beweiskraft zu senken.
+
+Diese Festlegungen wurden getroffen und committet, **bevor** ein einziges
+Ergebnis auf echten Daten existierte — die Git-Historie belegt das.
 
 ---
 
@@ -226,14 +230,29 @@ nachweisbar ist, dass der Analyseplan vor den Ergebnissen feststand.
 
 ```
 evaluation/
-  metrics.py       Matching, Precision/Recall/F1, Nullmodell      Schritt 1
-  dataset.py       Sessions laden, Evidenz cachen                 Schritt 2
-  fusion.py        Kandidaten, Merkmale, Random Forest + Regel     Schritt 2+3
-  experiment.py    LOSO über 25 Sessions x 8 Kombinationen         Schritt 3
-  analysis.py      Shapley, Interaktionsindex, Sättigungskurve     Schritt 4
-  statistics.py    Signifikanz, Konfidenzintervalle, Power         Schicht 5
-  reliability.py   Intrarater-Auswertung                           Schicht 5
+  metrics.py       Matching, Precision/Recall/F1, Nullmodell      Schritt 1  [fertig]
+  dataset.py       Ground Truth und Dauer einer Aufnahme          Schritt 1  [fertig]
+  fusion.py        Kandidaten, Merkmale, Random Forest + Regel     Schritt 2+3 [fertig]
+  experiment.py    LOSO über alle Sessions x 8 Kombinationen       Schritt 3  [fertig]
+  analysis.py      Shapley, Interaktionsindex, Sättigungskurve     Schritt 4  [fertig]
+  statistics.py    Signifikanz, Konfidenzintervalle, Power         Schicht 5  [offen]
+  reliability.py   Intrarater-Auswertung                           Schicht 5  [offen]
 ```
+
+### Festlegungen der Umsetzung
+
+- **Kandidaten aus den Score-Kurven**, nicht aus `boundaries_s`: Letztere sind
+  bereits bei 0,5 geschwellt; der Klassifikator könnte dann nur entfernen, nie
+  hinzufügen, und die Recall-Obergrenze wäre je Teilmenge festgezurrt.
+- **Fenster-Merkmale (±1 s)** statt Punktwerte: Der Events-Arm verankert einen
+  Kandidaten am Ende eines Eingabebursts, die Annotation am darauf folgenden
+  visuellen Einrasten. Das Fenster absorbiert diesen Versatz, ohne ihn an die
+  Daten anzupassen.
+- **Label-Toleranz fest bei 1 s**, auch während des Toleranz-Sweeps: So variiert
+  der Sweep nur, wie bewertet wird, nicht was das Modell gelernt hat.
+- **Keine Schwellenwert-Anpassung**: `class_weight="balanced"` im Random Forest
+  statt einer je Teilmenge angepassten Schwelle — eine solche Anpassung wäre ein
+  weiterer Weg, über den die Testsession einsickern könnte.
 
 Die Bibliothek muss **headless lauffähig** sein: ein Aufruf, der die
 Ergebnistabelle schreibt. Die GUI orchestriert und zeigt an, sie rechnet nicht.

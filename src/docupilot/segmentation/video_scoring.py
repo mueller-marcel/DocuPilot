@@ -20,10 +20,21 @@ import numpy as np
 
 def _load_dotenv() -> None:
     """
-    Read KEY=VALUE lines from a project-root .env into the environment. Never
+    Read KEY=VALUE lines from the project's .env into the environment. Never
     overwrites an already-set variable: the real environment wins.
+
+    The root is found by looking upwards for pyproject.toml rather than by a
+    fixed number of levels — a fixed one quietly stopped matching when the
+    package moved under src/, and a missing key looks exactly like a missing
+    .env.
     """
-    env_file = Path(__file__).resolve().parents[2] / ".env"
+    root = next(
+        (d for d in Path(__file__).resolve().parents if (d / "pyproject.toml").exists()),
+        None,
+    )
+    if root is None:
+        return
+    env_file = root / ".env"
     if not env_file.exists():
         return
     try:
