@@ -15,11 +15,11 @@ from scipy.signal import find_peaks
 
 from docupilot.segmentation.evidence import BoundaryEvidence
 
-# How far around a candidate a modality's score is read. Set to the primary
-# tolerance: the events arm anchors a candidate at the end of an input burst
-# while the annotation sits at the visual settling that follows, so a point
-# sample would miss a score that is plainly there. Absorbs that offset without
-# fitting it to the data.
+# How far around a candidate a modality's score is read. This absorbs the
+# SEMANTIC anchoring gap between modalities — the events arm fires at the end of
+# an input burst while the annotation sits at the visual settling that follows —
+# NOT clock desync, which is separately measured at ~tens of ms (see
+# evaluation.synchronization). Set to the primary tolerance; not fitted to data.
 FEATURE_WINDOW_S = 1.0
 
 # Two predictions closer than this cannot both be hits anyway — matching is

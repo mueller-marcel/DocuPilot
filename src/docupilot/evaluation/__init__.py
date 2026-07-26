@@ -6,8 +6,9 @@ the annotated boundaries, then attribute the result to the modalities.
     dataset.py      read ground truth and duration off a recording
     fusion.py       a subset of modalities becomes one prediction
     experiment.py   every subset on every session, leave-one-session-out
-    analysis.py     Shapley values, interaction index, saturation curve
-    statistics.py   is a difference real, and what can this corpus resolve
+    analysis.py       Shapley values, interaction index, saturation curve
+    statistics.py     is a difference real, and what can this corpus resolve
+    synchronization.py measure the modality clock alignment, don't assume it
 """
 
 from docupilot.evaluation.analysis import (
@@ -30,11 +31,19 @@ from docupilot.evaluation.statistics import (
     shapley_ci,
     subset_ci,
 )
+from docupilot.evaluation.synchronization import (
+    click_offsets_s,
+    report as sync_report,
+    stream_offset_ms,
+)
 
 __all__ = [
     "Interval",
     "Match",
     "SessionData",
+    "click_offsets_s",
+    "sync_report",
+    "stream_offset_ms",
     "delta_ci",
     "minimum_detectable_effect",
     "paired_sd",
