@@ -107,8 +107,14 @@ class Judgement:
 
 
 def _load_dotenv() -> None:
-    """Read a .env from the project root (see video_scoring for the why)."""
-    env_file = Path(__file__).resolve().parents[2] / ".env"
+    """Read the project's .env (see video_scoring for how the root is found)."""
+    root = next(
+        (d for d in Path(__file__).resolve().parents if (d / "pyproject.toml").exists()),
+        None,
+    )
+    if root is None:
+        return
+    env_file = root / ".env"
     if not env_file.exists():
         return
     try:

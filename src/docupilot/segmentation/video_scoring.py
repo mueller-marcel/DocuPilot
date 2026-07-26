@@ -1,7 +1,7 @@
 """
 The video modality's semantic stage: given two SETTLED screenshots, a VLM decides
-whether a user-triggered action completed between them. Cloud or local Ollama;
-both see the identical composite, so a gap between them is a result.
+whether a user-triggered action completed between them. The model runs in the
+cloud (Anthropic); which one is env-driven so it can be A/B-tested.
 
 Reads pixels only, never audio or the event stream.
 """
@@ -13,8 +13,6 @@ import hashlib
 import json
 import os
 import re
-import urllib.error
-import urllib.request
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -22,10 +20,21 @@ import numpy as np
 
 def _load_dotenv() -> None:
     """
-    Read KEY=VALUE lines from a project-root .env into the environment. Never
+    Read KEY=VALUE lines from the project's .env into the environment. Never
     overwrites an already-set variable: the real environment wins.
+
+    The root is found by looking upwards for pyproject.toml rather than by a
+    fixed number of levels — a fixed one quietly stopped matching when the
+    package moved under src/, and a missing key looks exactly like a missing
+    .env.
     """
-    env_file = Path(__file__).resolve().parents[2] / ".env"
+    root = next(
+        (d for d in Path(__file__).resolve().parents if (d / "pyproject.toml").exists()),
+        None,
+    )
+    if root is None:
+        return
+    env_file = root / ".env"
     if not env_file.exists():
         return
     try:
@@ -42,14 +51,10 @@ def _load_dotenv() -> None:
 
 _load_dotenv()
 
-# Backend: "anthropic" (cloud) or "ollama" (local). Override via DOCUPILOT_VLM.
-BACKEND = os.environ.get("DOCUPILOT_VLM", "anthropic").lower()
-
-CLOUD_MODEL = "claude-opus-4-8"
-OLLAMA_MODEL = "qwen2.5vl:7b"
-OLLAMA_HOST = os.environ.get("OLLAMA_HOST", "http://localhost:11434")
-
-MODEL = CLOUD_MODEL if BACKEND == "anthropic" else OLLAMA_MODEL
+# The model is env-driven so a faster/cheaper one (e.g. Haiku 4.5,
+# claude-haiku-4-5-20251001) can be A/B-tested without a code edit. Different
+# models get separate cache entries, so opus verdicts stay intact.
+MODEL = os.environ.get("DOCUPILOT_CLOUD_MODEL", "claude-opus-4-8")
 
 # Bump when the prompt or the score mapping changes — invalidates cached verdicts.
 PROMPT_VERSION = "v7"   # v7: goal-vs-means definition + async results;
@@ -164,9 +169,8 @@ class Judgement:
         return self.category == _BOUNDARY
 
 
-# The JSON the model must return. On the cloud backend this is enforced by the
-# API (structured outputs), so an unparseable answer cannot happen; on Ollama it
-# is only requested, and parse() has to cope with a malformed one.
+# The JSON the model must return. The API enforces it (structured outputs), so an
+# unparseable answer cannot happen; parse() stays defensive regardless.
 _SCHEMA = {
     "type": "object",
     "properties": {
@@ -179,30 +183,21 @@ _SCHEMA = {
 }
 
 
-# ── Backends ──────────────────────────────────────────────────────────────────
+# ── Cloud model ───────────────────────────────────────────────────────────────
 
-def is_available(model: str = MODEL) -> bool:
-    """True iff the configured backend can actually be called right now."""
-    if BACKEND == "anthropic":
-        try:
-            import anthropic  # noqa: F401
-        except ImportError:
-            return False
-        # Constructing the client is not enough — it succeeds without credentials
-        # and only fails on the first request. Check that one actually resolved.
-        try:
-            client = _client()
-        except Exception:
-            return False
-        return bool(getattr(client, "api_key", None) or getattr(client, "auth_token", None))
-
+def is_available() -> bool:
+    """True iff the cloud model can actually be called right now."""
     try:
-        with urllib.request.urlopen(f"{OLLAMA_HOST}/api/tags", timeout=2) as resp:
-            tags = json.loads(resp.read())
-    except (urllib.error.URLError, OSError, json.JSONDecodeError):
+        import anthropic  # noqa: F401
+    except ImportError:
         return False
-    # Exact, not by family: a wrong tag would block on Ollama pulling 6 GB.
-    return model in {m.get("name", "") for m in tags.get("models", [])}
+    # Constructing the client is not enough — it succeeds without credentials
+    # and only fails on the first request. Check that one actually resolved.
+    try:
+        client = _client()
+    except Exception:
+        return False
+    return bool(getattr(client, "api_key", None) or getattr(client, "auth_token", None))
 
 
 _ANTHROPIC_CLIENT = None
@@ -216,11 +211,9 @@ def _client():
     return _ANTHROPIC_CLIENT
 
 
-def ask(composite: bytes, model: str = MODEL, timeout: float = 600) -> str:
+def ask(composite: bytes, model: str = MODEL) -> str:
     """Send one BEFORE|AFTER composite to the model and return its raw answer."""
-    if BACKEND == "anthropic":
-        return _ask_anthropic(composite, model)
-    return _ask_ollama(composite, model, timeout)
+    return _ask_anthropic(composite, model)
 
 
 def _ask_anthropic(composite: bytes, model: str) -> str:
@@ -261,25 +254,6 @@ def _ask_anthropic(composite: bytes, model: str) -> str:
             "max_tokens in _ask_anthropic erhöhen."
         )
     return "".join(b.text for b in message.content if b.type == "text")
-
-
-def _ask_ollama(composite: bytes, model: str, timeout: float) -> str:
-    payload = json.dumps({
-        "model": model,
-        "system": _SYSTEM,
-        "prompt": _USER,
-        "images": [base64.b64encode(composite).decode()],
-        "stream": False,
-        "format": "json",
-        "options": {"temperature": 0.0},
-        "keep_alive": "30m",   # otherwise every call reloads 6 GB from disk
-    }).encode()
-    req = urllib.request.Request(
-        f"{OLLAMA_HOST}/api/generate", data=payload,
-        headers={"Content-Type": "application/json"},
-    )
-    with urllib.request.urlopen(req, timeout=timeout) as resp:
-        return json.loads(resp.read()).get("response", "")
 
 
 def parse(raw: str) -> Judgement | None:
