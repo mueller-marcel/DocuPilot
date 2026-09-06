@@ -8,19 +8,19 @@ cannot leak into a result.
 
 from __future__ import annotations
 
-import subprocess
+from docupilot.evaluation import media
+from docupilot.recording.session import DEFAULT_BOUNDARY_KIND, RecordingSession
 
-from docupilot.recording.session import RecordingSession
 
-
-def ground_truth_s(session: RecordingSession) -> list[float]:
+def ground_truth_s(session: RecordingSession, kind: str = DEFAULT_BOUNDARY_KIND) -> list[float]:
     """
-    The annotated boundaries in seconds, ascending.
+    The annotated boundaries of one definition in seconds, ascending.
 
     :param session: the recording; its ground_truth.json holds milliseconds.
+    :param kind: "end" (result settled) or "start" (next action's first input).
     :return: boundary timestamps in seconds.
     """
-    return sorted(t_ms / 1000.0 for t_ms, _ in session.ground_truth_markers())
+    return sorted(t_ms / 1000.0 for t_ms, _ in session.ground_truth_markers(kind))
 
 
 def duration_s(session: RecordingSession) -> float:
@@ -34,15 +34,11 @@ def duration_s(session: RecordingSession) -> float:
     :return: duration in seconds.
     :raises RuntimeError: when the duration cannot be read.
     """
-    out = subprocess.run(
-        ["ffprobe", "-v", "error", "-show_entries", "format=duration",
-         "-of", "csv=p=0", str(session.recording_path)],
-        capture_output=True, text=True,
-    ).stdout.strip()
+    info = media.probe(session.recording_path)
     try:
-        return float(out)
-    except ValueError:
+        return info.duration_s
+    except RuntimeError:
         raise RuntimeError(
             f"Dauer von {session.recording_path} nicht lesbar — ffprobe lieferte "
-            f"{out!r}."
+            f"{info.duration_raw!r}."
         ) from None

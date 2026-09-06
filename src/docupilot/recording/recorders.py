@@ -93,11 +93,13 @@ class AvRecorder:
                 bgra = np.frombuffer(screenshot.raw, dtype=np.uint8).reshape(
                     screenshot.height, screenshot.width, 4
                 )
-                bgr = bgra[:, :, :3].copy()
+                # tobytes() on the strided view already produces a packed BGR
+                # copy; an explicit .copy() first would touch every frame twice.
+                bgr_bytes = bgra[:, :, :3].tobytes()
 
                 try:
                     if self._proc and self._proc.stdin:
-                        self._proc.stdin.write(bgr.tobytes())
+                        self._proc.stdin.write(bgr_bytes)
                         self._proc.stdin.flush()
                 except (BrokenPipeError, OSError):
                     break

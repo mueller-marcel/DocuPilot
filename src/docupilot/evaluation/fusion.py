@@ -12,22 +12,45 @@ from collections.abc import Mapping, Sequence
 
 import numpy as np
 from scipy.signal import find_peaks
+from scipy.stats import rankdata
 
+from docupilot.evaluation import metrics
 from docupilot.segmentation.evidence import BoundaryEvidence
 
-# How far around a candidate a modality's score is read. This absorbs the
-# SEMANTIC anchoring gap between modalities — the events arm fires at the end of
-# an input burst while the annotation sits at the visual settling that follows —
-# NOT clock desync, which is separately measured at ~tens of ms (see
-# evaluation.synchronization). Set to the primary tolerance; not fitted to data.
-FEATURE_WINDOW_S = 1.0
+# Half-widths the score is read over around a candidate. Several widths, so the
+# decider can tell a sharp peak (video: the settling instant) from a broad
+# plateau (audio: an execution window) — the temporal precision of a modality
+# becomes a feature instead of a handicap. The set is the SAME for every
+# modality: an asymmetric recipe would move the Shapley values by design
+# effort, not by information.
+FEATURE_WINDOWS_S: tuple[float, ...] = (0.5, 1.0, 2.0)
+
+# Names of the feature columns one modality contributes, in order.
+FEATURE_NAMES: tuple[str, ...] = (
+    "point",                                   # score at the candidate instant
+    *(f"max_{w:g}s" for w in FEATURE_WINDOWS_S),
+    "rank",                                    # session-relative rank of max_1s
+)
+FEATURES_PER_MODALITY = len(FEATURE_NAMES)
+
+# Window whose maximum the rank feature is taken over. The primary tolerance,
+# so the rank is "how strong is this modality here, on the scale it is scored
+# at" — a per-session normalisation that costs no label.
+_RANK_WINDOW_S = 1.0
 
 # Two predictions closer than this cannot both be hits anyway — matching is
 # one-to-one — so the weaker one is suppressed.
 SUPPRESS_RADIUS_S = 1.0
 
+# Decision thresholds the calibration may pick from. Coarse on purpose: a finer
+# grid would fit the training folds' noise, and 0.05 steps already move F1 by
+# less than the corpus can resolve.
+THRESHOLD_GRID: tuple[float, ...] = tuple(round(0.05 * k, 2) for k in range(1, 20))
+
 Evidence = Mapping[str, BoundaryEvidence]
 
+
+# ── Candidates ────────────────────────────────────────────────────────────────
 
 def candidate_times(evidence: Evidence, subset: Sequence[str]) -> np.ndarray:
     """
@@ -52,6 +75,8 @@ def candidate_times(evidence: Evidence, subset: Sequence[str]) -> np.ndarray:
     return np.sort(np.asarray(times, dtype=np.float64))
 
 
+# ── Features ──────────────────────────────────────────────────────────────────
+
 def _window_max(times_s: np.ndarray, score: np.ndarray, t: float, window_s: float) -> float:
     """Highest score within +/- window_s of t; 0.0 when the window is empty."""
     lo = int(np.searchsorted(times_s, t - window_s, side="left"))
@@ -59,32 +84,54 @@ def _window_max(times_s: np.ndarray, score: np.ndarray, t: float, window_s: floa
     return float(score[lo:hi].max()) if hi > lo else 0.0
 
 
-def feature_matrix(
-    times: np.ndarray,
-    evidence: Evidence,
-    subset: Sequence[str],
-    window_s: float = FEATURE_WINDOW_S,
-) -> np.ndarray:
+def _value_at(times_s: np.ndarray, score: np.ndarray, t: float) -> float:
+    """Score of the sample nearest to t; 0.0 for an empty lane."""
+    if len(times_s) == 0:
+        return 0.0
+    i = int(np.searchsorted(times_s, t))
+    if i > 0 and (i == len(times_s) or abs(times_s[i - 1] - t) <= abs(times_s[i] - t)):
+        i -= 1
+    return float(score[i])
+
+
+def _modality_features(times: np.ndarray, ev: BoundaryEvidence) -> np.ndarray:
+    """One modality's block: (n_candidates, FEATURES_PER_MODALITY)."""
+    n = len(times)
+    block = np.zeros((n, FEATURES_PER_MODALITY), dtype=np.float64)
+    if n == 0:
+        return block
+    block[:, 0] = [_value_at(ev.times_s, ev.score, float(t)) for t in times]
+    for column, window in enumerate(FEATURE_WINDOWS_S, start=1):
+        block[:, column] = [_window_max(ev.times_s, ev.score, float(t), window) for t in times]
+    rank_source = [_window_max(ev.times_s, ev.score, float(t), _RANK_WINDOW_S) for t in times]
+    # Average ranks scaled to (0, 1]: ties (many zeros) share a rank instead of
+    # being ordered by position, which would leak the candidate index.
+    block[:, -1] = rankdata(rank_source, method="average") / n
+    return block
+
+
+def feature_matrix(times: np.ndarray, evidence: Evidence, subset: Sequence[str]) -> np.ndarray:
     """
-    One row per candidate, one column per modality in the subset.
+    One row per candidate, FEATURES_PER_MODALITY columns per modality in the
+    subset, blocks in the given order.
 
     :param times: candidate timestamps in seconds.
     :param evidence: one BoundaryEvidence per modality.
-    :param subset: which modalities become columns, in the given order.
-    :param window_s: half-width of the window a score is read over.
-    :return: array of shape (len(times), len(subset)).
+    :param subset: which modalities become column blocks, in the given order.
+    :return: array of shape (len(times), FEATURES_PER_MODALITY * len(subset)).
     """
-    if len(times) == 0 or not subset:
-        return np.zeros((len(times), len(subset)), dtype=np.float64)
+    if not subset:
+        return np.zeros((len(times), 0), dtype=np.float64)
+    return np.hstack([_modality_features(times, evidence[m]) for m in subset])
 
-    return np.column_stack([
-        [
-            _window_max(evidence[m].times_s, evidence[m].score, float(t), window_s)
-            for t in times
-        ]
-        for m in subset
-    ])
 
+def block_columns(position: int) -> list[int]:
+    """The column indices of the modality at `position` in a feature matrix."""
+    start = position * FEATURES_PER_MODALITY
+    return list(range(start, start + FEATURES_PER_MODALITY))
+
+
+# ── Labels and decisions ──────────────────────────────────────────────────────
 
 def label_candidates(times: np.ndarray, gt_s: Sequence[float], tau_s: float) -> np.ndarray:
     """
@@ -129,39 +176,57 @@ def suppress(
     return sorted(kept)
 
 
-# ── Deciders ──────────────────────────────────────────────────────────────────
+def decide(times: np.ndarray, proba: np.ndarray, threshold: float) -> list[float]:
+    """Candidates at or above the threshold, one per neighbourhood."""
+    keep = proba >= threshold
+    return suppress(times[keep], proba[keep])
 
-class RuleFuser:
+
+def choose_threshold(
+    folds: Sequence[tuple[np.ndarray, np.ndarray, Sequence[float]]],
+    tau_s: float,
+    grid: Sequence[float] = THRESHOLD_GRID,
+) -> float:
     """
-    Untrained baseline: a candidate is a boundary when any of the subset's
-    modalities is confident enough about it.
+    The decision threshold that maximises macro F1 over the given sessions.
 
-    Needs no training data and therefore no cross-validation, so it carries no
-    model variance. Its purpose is the cross-check — if it puts the modalities in
-    the same Shapley order as the forest, that ordering does not depend on the
-    choice of classifier.
+    Meant to be fed with TRAINING sessions and out-of-bag probabilities, so the
+    held-out session never touches the operating point. Macro F1 because the
+    characteristic function of the experiment is a macro average — the
+    threshold optimises the quantity that is later attributed.
+
+    Ties go to the value nearest 0.5: a flat optimum should not pull the
+    operating point to an extreme by accident of grid order.
+
+    :param folds: (candidate times, probabilities, ground truth) per session.
+    :param tau_s: tolerance the F1 is scored at.
+    :return: a value from `grid`; 0.5 when there is nothing to score.
     """
+    best_t, best_f1 = 0.5, -1.0
+    for t in grid:
+        f1s = [
+            metrics.match(gt, decide(times, proba, t), tau_s).f1
+            for times, proba, gt in folds
+        ]
+        f1 = float(np.mean(f1s)) if f1s else 0.0
+        better = f1 > best_f1 + 1e-12
+        tie = abs(f1 - best_f1) <= 1e-12 and abs(t - 0.5) < abs(best_t - 0.5)
+        if better or tie:
+            best_t, best_f1 = float(t), f1
+    return best_t
 
-    def __init__(self, threshold: float = 0.5) -> None:
-        self._threshold = threshold
 
-    def fit(self, features: np.ndarray, labels: np.ndarray) -> "RuleFuser":
-        return self                                    # nothing to learn
-
-    def predict_proba(self, features: np.ndarray) -> np.ndarray:
-        if features.size == 0:
-            return np.zeros(len(features), dtype=np.float64)
-        return features.max(axis=1)
-
+# ── Decider ───────────────────────────────────────────────────────────────────
 
 class ForestFuser:
     """
-    Random forest over the subset's scores.
+    Random forest over the subset's features.
 
     Learns how the modalities combine instead of assuming it, which is what the
     question about *information* content asks for. `class_weight="balanced"`
-    handles the imbalance so no decision threshold has to be tuned — a threshold
-    fitted per subset would be one more place for the test session to leak in.
+    handles the imbalance; the operating point is still calibrated afterwards,
+    on out-of-bag predictions, because a balanced weighting does not make 0.5
+    the F1-optimal cut.
     """
 
     def __init__(self, n_estimators: int = 300, seed: int = 0) -> None:
@@ -169,6 +234,7 @@ class ForestFuser:
         self._seed = seed
         self._model = None
         self._constant = 0.0
+        self._oob: np.ndarray | None = None
 
     def fit(self, features: np.ndarray, labels: np.ndarray) -> "ForestFuser":
         from sklearn.ensemble import RandomForestClassifier
@@ -180,16 +246,34 @@ class ForestFuser:
         if len(classes) < 2:
             self._model = None
             self._constant = float(classes[0]) if len(classes) else 0.0
+            self._oob = np.full(len(labels), self._constant, dtype=np.float64)
             return self
 
         self._model = RandomForestClassifier(
             n_estimators=self._n_estimators,
             class_weight="balanced",
             random_state=self._seed,
+            oob_score=True,
             n_jobs=-1,
         )
         self._model.fit(features, labels)
+        oob = self._model.oob_decision_function_[:, 1]
+        # A row no tree left out has no out-of-bag vote (NaN); with hundreds of
+        # trees that is practically never, and "undecided" is the honest fill.
+        self._oob = np.where(np.isnan(oob), 0.5, oob)
         return self
+
+    def oob_proba(self) -> np.ndarray:
+        """
+        P(boundary) for every training row, from trees that did not see it —
+        a leakage-free estimate of the model's behaviour on the training
+        sessions, available without a single extra fit.
+
+        :raises RuntimeError: before fit().
+        """
+        if self._oob is None:
+            raise RuntimeError("oob_proba() vor fit() aufgerufen")
+        return self._oob
 
     def predict_proba(self, features: np.ndarray) -> np.ndarray:
         if features.size == 0:

@@ -112,11 +112,11 @@ class MainWindow(QMainWindow):
         """
 
         page = QWidget()
-        page.setStyleSheet("background:#111;")
+        page.setStyleSheet("background:#f7f7f7;")
         layout = QVBoxLayout(page)
         label = QLabel("Aufnahme wird finalisiert\nBitte warten…")
         label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        label.setStyleSheet("color:#aaa; font-size:16px; line-height:1.8;")
+        label.setStyleSheet("color:#555; font-size:16px; line-height:1.8;")
         layout.addStretch()
         layout.addWidget(label)
         layout.addStretch()
@@ -124,11 +124,9 @@ class MainWindow(QMainWindow):
 
     def _setup_menu_bar(self) -> None:
         """
-        Erstellt die Menüleiste mit "Datei > Öffnen", um eine bestehende
-        Session (recording.mp4 + events.json, optional ground_truth.json)
-        aus einem Verzeichnis zu laden.
-
-        :return: None
+        Menu bar: "Datei > Öffnen" loads an existing session (recording.mp4 +
+        events.json, optional ground_truth.json) from a directory; "Auswertung"
+        reaches the corpus experiment.
         """
 
         file_menu = self.menuBar().addMenu("&Datei")
@@ -140,23 +138,41 @@ class MainWindow(QMainWindow):
 
         analysis_menu = self.menuBar().addMenu("&Auswertung")
 
-        experiment_action = QAction("&Informationsbeitrag der Modalitäten…", self)
+        run_corpus_action = QAction("&Korpus auswählen und auswerten…", self)
+        run_corpus_action.triggered.connect(self._on_run_corpus)
+        analysis_menu.addAction(run_corpus_action)
+
+        experiment_action = QAction("Auswertungsfenster &öffnen…", self)
         experiment_action.triggered.connect(self._on_open_experiment)
         analysis_menu.addAction(experiment_action)
 
-    def _on_open_experiment(self) -> None:
+    def _show_experiment_window(self) -> ExperimentWindow:
         """
-        Öffnet das Auswertungsfenster für einen ganzen Korpus. Nicht-modal, damit
-        der stundenlange Lauf die restliche Anwendung nicht blockiert.
-
-        :return: None
+        The one experiment window, created on first use and brought to front.
+        Non-modal, so an hours-long run does not block the rest of the app.
         """
-
         if self.experiment_window is None:
             self.experiment_window = ExperimentWindow(self)
         self.experiment_window.show()
         self.experiment_window.raise_()
         self.experiment_window.activateWindow()
+        return self.experiment_window
+
+    def _on_open_experiment(self) -> None:
+        self._show_experiment_window()
+
+    def _on_run_corpus(self) -> None:
+        """
+        Pick a corpus directory and start the whole workflow (segmentation
+        through evaluation) at once. Each session's model verdicts are cached
+        beside it, so a session goes through the cloud model only once.
+        """
+        directory = QFileDialog.getExistingDirectory(
+            self, "Korpus-Verzeichnis wählen"
+        )
+        if not directory:
+            return
+        self._show_experiment_window().run_directory(Path(directory))
 
     def _show_recorder_page(self) -> None:
         """
@@ -247,12 +263,8 @@ class MainWindow(QMainWindow):
 
     def _on_open_session(self) -> None:
         """
-        Öffnet einen Verzeichnis-Dialog und lädt die dort enthaltene Session
-        (recording.mp4, events.json, optional ground_truth.json) über
-        RecordingSession.from_directory(). Bei Erfolg wird direkt die
-        Annotation-Seite mit der geladenen Session angezeigt.
-
-        :return: None
+        Pick a session directory and open it on the annotation page. A directory
+        without recording.mp4 or events.json is reported, not opened.
         """
 
         directory = QFileDialog.getExistingDirectory(

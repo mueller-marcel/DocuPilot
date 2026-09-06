@@ -14,10 +14,10 @@ from PySide6.QtWidgets import (
 )
 
 from docupilot.recording.session import RecordingSession
-from docupilot.segmentation import MODALITIES, segment
+from docupilot.segmentation import MODALITIES, BoundaryEvidence, segment
 from docupilot.ui.widgets.FeatureTimelineWidget import FeatureTimelineWidget
 
-_GROUND_TRUTH_COLOR = "#34d399"
+_GROUND_TRUTH_COLOR = "#059669"
 
 # How each modality is presented. The keys are the segmentation package's
 # modality names; everything in the value is a UI decision and lives only here.
@@ -46,7 +46,13 @@ _LANES: dict[str, dict[str, str]] = {
 class _FeatureWorker(QObject):
     """Runs segmentation OFF the UI thread and turns its callbacks into signals."""
 
-    lane_ready  = Signal(str, object)   # (modality, BoundaryEvidence)
+    # The evidence stays HERE and the signal carries only the modality that is
+    # done. A queued cross-thread signal marshals every argument, and an `object`
+    # payload has to go through a wrapper whose construction fails on this stack
+    # ("__init__() should return None, not 'NoneType'") — reported once per lane,
+    # because segment() runs the callback inside its own try. A key the receiver
+    # looks up needs no wrapper.
+    lane_ready  = Signal(str)           # modality; the evidence via evidence()
     lane_failed = Signal(str, str)      # (modality, message)
     progress    = Signal(str, int, int)  # (modality, done, total)
     finished    = Signal()
@@ -55,15 +61,25 @@ class _FeatureWorker(QObject):
         super().__init__()
         self._session = session
         self._cancelled = False
+        self._evidence: dict[str, BoundaryEvidence] = {}
 
     def cancel(self) -> None:
         """Ask the run to stop at the next point segmentation checks."""
         self._cancelled = True
 
+    def evidence(self, modality: str) -> BoundaryEvidence | None:
+        """One finished lane's evidence, or None while it has not arrived."""
+        return self._evidence.get(modality)
+
+    def _keep(self, modality: str, evidence: BoundaryEvidence) -> None:
+        """Store first, announce second — the receiver reads only after the emit."""
+        self._evidence[modality] = evidence
+        self.lane_ready.emit(modality)
+
     def run(self) -> None:
         segment(
             self._session,
-            on_result=self.lane_ready.emit,
+            on_result=self._keep,
             on_error=self.lane_failed.emit,
             on_progress=self.progress.emit,
             is_cancelled=lambda: self._cancelled,
@@ -138,17 +154,17 @@ class FeatureDialog(QDialog):
             "gestrichelt = gesetzte Grenzen  ·  Klick auf Timeline → Sprung im Video"
             + ("  ·  Ground Truth (grün)" if self._ground_truth_markers else "")
         )
-        header.setStyleSheet("color:#aaa; font-size:11px;")
+        header.setStyleSheet("color:#555; font-size:11px;")
         root.addWidget(header)
 
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
         scroll.setFrameShape(QFrame.Shape.NoFrame)
         scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
-        scroll.setStyleSheet("background:#1e1e2e;")
+        scroll.setStyleSheet("background:#ffffff;")
 
         lanes_widget = QWidget()
-        lanes_widget.setStyleSheet("background:#1e1e2e;")
+        lanes_widget.setStyleSheet("background:#ffffff;")
         self._lanes_layout = QVBoxLayout(lanes_widget)
         self._lanes_layout.setContentsMargins(0, 0, 0, 0)
         self._lanes_layout.setSpacing(2)
@@ -176,7 +192,7 @@ class FeatureDialog(QDialog):
         root.addWidget(scroll, stretch=1)
 
         self._status = QLabel("Wird berechnet …")
-        self._status.setStyleSheet("color:#666; font-size:10px;")
+        self._status.setStyleSheet("color:#666; font-size:10px;")  # gut lesbar auf Weiß
         root.addWidget(self._status)
 
         close_btn = QPushButton("Schließen")
@@ -198,14 +214,14 @@ class FeatureDialog(QDialog):
         """Add a section header, a lane label and its canvas; return the canvas."""
         separator = QFrame()
         separator.setFrameShape(QFrame.Shape.HLine)
-        separator.setStyleSheet("color:#333355; margin:6px 0;")
+        separator.setStyleSheet("color:#dddddd; margin:6px 0;")
         self._lanes_layout.addWidget(separator)
 
         section_label = QLabel(section)
         section_label.setFixedHeight(24)
         section_label.setStyleSheet(
-            "color:#aaa; font-size:11px; font-style:italic;"
-            "background:#1e1e2e; padding-left:6px;"
+            "color:#555; font-size:11px; font-style:italic;"
+            "background:#ffffff; padding-left:6px;"
         )
         self._lanes_layout.addWidget(section_label)
 
@@ -213,7 +229,7 @@ class FeatureDialog(QDialog):
         lane_label.setFixedHeight(22)
         lane_label.setStyleSheet(
             f"color:{hex_color}; font-size:11px; font-weight:600; "
-            f"background:#1e1e2e; border-left:3px solid {hex_color}; padding-left:6px;"
+            f"background:#ffffff; border-left:3px solid {hex_color}; padding-left:6px;"
         )
         self._lanes_layout.addWidget(lane_label)
 
@@ -250,8 +266,11 @@ class FeatureDialog(QDialog):
             "  " + "  ·  ".join(self._lane_status[m] for m in MODALITIES)
         )
 
-    def _on_lane_ready(self, modality: str, evidence) -> None:
+    def _on_lane_ready(self, modality: str) -> None:
         """Draw one modality's curve and the boundaries it committed to."""
+        evidence = None if self._worker is None else self._worker.evidence(modality)
+        if evidence is None:                      # cancelled between emit and slot
+            return
         canvas = self._lanes[modality]
         canvas.set_curve(
             evidence.times_s.tolist(), evidence.score.tolist(), _LANES[modality]["color"]

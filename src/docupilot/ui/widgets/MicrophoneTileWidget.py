@@ -17,7 +17,7 @@ class MicrophoneTileWidget(DeviceTileWidget):
 
         icon_label = QLabel("🎤")
         icon_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        icon_label.setStyleSheet("font-size: 64px; color: white;")
+        icon_label.setStyleSheet("font-size: 64px; color: #555555;")
 
         super().__init__(
             device=microphone,

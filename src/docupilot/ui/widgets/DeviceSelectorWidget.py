@@ -2,20 +2,22 @@ from collections.abc import Callable
 from typing import Any
 
 from PySide6.QtCore import Qt, Signal
-from PySide6.QtWidgets import QAbstractButton, QButtonGroup, QFrame, QGridLayout, QLabel, QScrollArea, QVBoxLayout, QWidget
+from PySide6.QtWidgets import (
+    QAbstractButton, QButtonGroup, QFrame, QGridLayout, QLabel, QScrollArea,
+    QVBoxLayout, QWidget,
+)
 
 
 class DeviceSelectorWidget(QWidget):
     """
-    Generic widget for selecting a device from a grid of options.
+    Generic widget for selecting a device from a grid of tiles.
 
-    This widget allows the user to select a device from a dynamically generated
-    grid of tiles. It is designed to support various types of devices by using
-    a factory pattern for creating tile widgets and providing flexibility
-    in defining the attributes associated with the devices.
+    The device kind is not known here: a factory builds the tile for each
+    device and a loader lists them, so the same grid serves screens and
+    microphones.
 
-    :ivar device_selected: Signal emitted when a device is selected, passing the selected device.
-    :type device_selected: Signal
+    :ivar device_selected: emitted with the selected device whenever the
+        selection changes, including the initial default.
     """
 
     device_selected = Signal(object)
@@ -31,17 +33,16 @@ class DeviceSelectorWidget(QWidget):
         parent: QWidget | None = None,
     ) -> None:
         """
-        Initialize the generic device selector widget.
-
         :param title: Title shown above the selector.
         :param load_devices: Function that returns all available devices.
         :param tile_factory: Factory that creates a tile widget for a given device.
-        :param selected_attr_name: Name of the tile attribute that contains the represented device. Example: "screen" or "microphone".
-        :param default_device_resolver: Optional function that returns the preferred default device.
+        :param selected_attr_name: Name of the tile attribute that contains the
+            represented device, for tiles that do not expose `.device`.
+        :param default_device_resolver: Optional function that returns the preferred
+            default device.
         :param columns: Number of columns in the grid.
         :param parent: Parent widget.
         """
-
         super().__init__(parent)
 
         self._title = title
@@ -59,10 +60,6 @@ class DeviceSelectorWidget(QWidget):
         self.reload_devices()
 
     def _build_ui(self) -> None:
-        """
-        Build the user interface for the selector widget.
-        """
-
         root_layout = QVBoxLayout(self)
         root_layout.setContentsMargins(0, 0, 0, 0)
         root_layout.setSpacing(10)
@@ -87,11 +84,14 @@ class DeviceSelectorWidget(QWidget):
         self._scroll_area.setWidget(self._content_widget)
         root_layout.addWidget(self._scroll_area)
 
-    def reload_devices(self) -> None:
-        """
-        Load available devices and rebuild the grid.
-        """
+    def _device_of(self, tile: Any) -> Any:
+        """The device a tile represents; None when the tile carries none."""
+        if hasattr(tile, "device"):
+            return tile.device
+        return getattr(tile, self._selected_attr_name, None)
 
+    def reload_devices(self) -> None:
+        """Load available devices and rebuild the grid."""
         self._clear_grid()
 
         devices = self._load_devices()
@@ -109,10 +109,7 @@ class DeviceSelectorWidget(QWidget):
             tile = self._tile_factory(device)
             tile.clicked.connect(self._on_tile_clicked)
 
-            row = index // self._columns
-            col = index % self._columns
-
-            self._grid.addWidget(tile, row, col)
+            self._grid.addWidget(tile, index // self._columns, index % self._columns)
             self._button_group.addButton(tile, index)
 
             if default_device is not None and self._devices_equal(device, default_device):
@@ -123,26 +120,20 @@ class DeviceSelectorWidget(QWidget):
             selected_button = default_button or buttons[0]
             selected_button.setChecked(True)
 
-            self._selected_device = getattr(selected_button, self._selected_attr_name, None)
+            self._selected_device = self._device_of(selected_button)
             self.device_selected.emit(self._selected_device)
 
     def _on_tile_clicked(self) -> None:
-        """
-        Handle clicks on a tile.
-        """
-
         button = self.sender()
-        if button is None or not hasattr(button, self._selected_attr_name):
+        if button is None or not (
+            hasattr(button, "device") or hasattr(button, self._selected_attr_name)
+        ):
             return
 
-        self._selected_device = getattr(button, self._selected_attr_name)
+        self._selected_device = self._device_of(button)
         self.device_selected.emit(self._selected_device)
 
     def _clear_grid(self) -> None:
-        """
-        Remove all tiles from the grid.
-        """
-
         while self._grid.count():
             if (item := self._grid.takeAt(0)) is None:
                 continue
@@ -153,10 +144,8 @@ class DeviceSelectorWidget(QWidget):
 
     @staticmethod
     def _devices_equal(left: Any, right: Any) -> bool:
-        """
-        Compare two devices. Uses 'id()' when available, otherwise falls back to equality.
-        """
-
+        """Compare by id() when both sides offer one — Qt device objects are
+        value types whose identity is their id, not their Python object."""
         if left is None or right is None:
             return False
 
@@ -169,8 +158,5 @@ class DeviceSelectorWidget(QWidget):
         return left == right
 
     def get_selected_device(self):
-        """
-        Return the currently selected device.
-        """
-
+        """The currently selected device, or None when there is none."""
         return self._selected_device

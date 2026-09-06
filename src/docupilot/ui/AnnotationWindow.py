@@ -25,7 +25,8 @@ from docupilot.ui.widgets.FeatureDialog import FeatureDialog
 
 
 class _MarkerSlider(QSlider):
-    """Horizontaler Slider mit farbigen Marker-Dots über der Groove."""
+    """Horizontal slider with coloured marker dots drawn over the groove — the
+    input events, so the annotator sees where the user acted while scrubbing."""
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(Qt.Orientation.Horizontal, parent)
@@ -62,9 +63,12 @@ class _MarkerSlider(QSlider):
 
 class AnnotationWindow(QWidget):
     """
-    Annotation-Seite nach dem Stoppen einer Aufnahme.
-    Orchestriert Player, Toolbar, Bottombar, EventsPanelWidget und FeatureDialog.
-    Ground-Truth-Grenzen leben ausschließlich in session.ground_truth_data.
+    The annotation page shown after a recording stops or a session is opened.
+
+    Orchestrates player, toolbar, bottom bar, EventsPanelWidget and FeatureDialog.
+    Ground-truth boundaries live exclusively in session.ground_truth_data; this
+    page never shows model output while annotating, so the ground truth cannot
+    end up confirming the detector.
     """
 
     back_requested = Signal()
@@ -242,24 +246,51 @@ class AnnotationWindow(QWidget):
         self._play_button = self._make_transport_btn("▶", "Play / Pause")
         btn_fwd   = self._make_transport_btn("5s ▶", "5 s vor")
         btn_end   = self._make_transport_btn("⏭", "Zum Ende")
+        self._mute_button = self._make_transport_btn("🔊", "Ton ausschalten")
+        self._mute_button.setCheckable(True)
 
         btn_start.clicked.connect(lambda: self._seek_to(0))
         btn_back.clicked.connect(lambda: self._seek_relative(-5000))
         self._play_button.clicked.connect(self._toggle_play)
         btn_fwd.clicked.connect(lambda: self._seek_relative(5000))
         btn_end.clicked.connect(lambda: self._seek_to(self._duration_ms))
+        self._mute_button.clicked.connect(self._toggle_mute)
 
-        self._boundary_button = QPushButton("✂  Grenze setzen")
+        self._boundary_button = QPushButton("✂  Grenze setzen (Ende)")
         self._boundary_button.setCursor(Qt.CursorShape.PointingHandCursor)
         self._boundary_button.setFixedHeight(30)
+        self._boundary_button.setToolTip(
+            "Der ausgelöste Zustand ist sichtbar und dauerhaft — die Definition der Arbeit"
+        )
         self._apply_boundary_idle_style()
-        self._boundary_button.clicked.connect(self._set_boundary)
+        self._boundary_button.clicked.connect(lambda: self._set_boundary("end"))
+
+        # The second definition (the exposé's): the next action's first input.
+        # Annotated alongside, never instead, so the evaluation can show how
+        # much of a modality's contribution rides on the definition.
+        self._start_button = QPushButton("▶  Beginn setzen")
+        self._start_button.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._start_button.setFixedHeight(30)
+        self._start_button.setToolTip(
+            "Erste Eingabe des nächsten Schritts — die Definition des Exposés"
+        )
+        self._start_button.setStyleSheet(
+            "QPushButton{background:#eef2ff;color:#3730a3;border:1.5px solid #6366f1;"
+            "border-radius:5px;font-size:13px;font-weight:600;padding:0 16px;}"
+            "QPushButton:hover{background:#e0e7ff;}"
+            "QPushButton:pressed{background:#c7d2fe;}"
+        )
+        self._start_button.clicked.connect(lambda: self._set_boundary("start"))
 
         transport_row = QHBoxLayout()
         transport_row.setSpacing(6)
         for b in (btn_start, btn_back, self._play_button, btn_fwd, btn_end):
             transport_row.addWidget(b)
+        transport_row.addSpacing(10)
+        transport_row.addWidget(self._mute_button)
         transport_row.addStretch()
+        transport_row.addWidget(self._start_button)
+        transport_row.addSpacing(6)
         transport_row.addWidget(self._boundary_button)
         layout.addLayout(transport_row)
 
@@ -294,9 +325,11 @@ class AnnotationWindow(QWidget):
         self._duration_ms = float(duration_ms)
         self._duration_label.setText(format_ms(float(duration_ms)))
         if self._duration_ms > 0 and self._session is not None:
+            # Filter the log already in memory rather than reading events.json
+            # again for the same content.
             fractions = [
                 ev.get("t_ms", 0.0) / self._duration_ms
-                for ev in self._session.input_events()
+                for ev in RecordingSession.input_events_of(self._events)
             ]
             self._slider.set_markers(fractions)
 
@@ -316,6 +349,13 @@ class AnnotationWindow(QWidget):
             self._player.pause()
         else:
             self._player.play()
+
+    def _toggle_mute(self) -> None:
+        """Mute or unmute the session playback."""
+        muted = not self._audio.isMuted()
+        self._audio.setMuted(muted)
+        self._mute_button.setText("🔇" if muted else "🔊")
+        self._mute_button.setToolTip("Ton einschalten" if muted else "Ton ausschalten")
 
     def _seek_to(self, ms: float) -> None:
         self._player.setPosition(int(ms))
@@ -338,15 +378,16 @@ class AnnotationWindow(QWidget):
 
     # ── Boundary actions ───────────────────────────────────────────────────────
 
-    def _set_boundary(self) -> None:
+    def _set_boundary(self, kind: str = "end") -> None:
         if self._session is None:
             return
         # The MP4 carries real timestamps, so the player position already is the
         # common clock the events and video use — no conversion needed.
         pos_ms = float(self._player.position())
-        self._session.add_ground_truth_boundary(pos_ms, label=format_ms(pos_ms))
+        self._session.add_ground_truth_boundary(pos_ms, label=format_ms(pos_ms), kind=kind)
         self._update_boundary_count()
-        self._flash_boundary_button()
+        if kind == "end":
+            self._flash_boundary_button()
 
     def _show_boundary_dialog(self) -> None:
         if self._session is None:
@@ -359,8 +400,12 @@ class AnnotationWindow(QWidget):
     def _update_boundary_count(self) -> None:
         if self._session is None:
             return
-        n = len(self._session.ground_truth_data)
-        self._boundary_count_label.setText(f"{n} Grenze{'n' if n != 1 else ''} gesetzt")
+        n = self._session.count_boundaries("end")
+        n_start = self._session.count_boundaries("start")
+        self._boundary_count_label.setText(
+            f"{n} Grenze{'n' if n != 1 else ''} gesetzt"
+            + (f"  ·  {n_start} Beginn" if n_start else "")
+        )
 
     def _flash_boundary_button(self) -> None:
         self._boundary_button.setStyleSheet(

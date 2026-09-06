@@ -81,6 +81,24 @@ nicht interpretierbar.
 
 ---
 
+## Methodische Schärfung (06.09.2026)
+
+Die folgenden Festlegungen ersetzen die entsprechenden Absätze weiter unten;
+der Code in `evaluation/` ist die Referenz.
+
+| Punkt | Vorher | Jetzt | Warum |
+|---|---|---|---|
+| Kandidatenpool | nur Union, fixiert | **Union (primär)** und **isoliert je Teilmenge** (`experiment.run(pool=...)`) | TF1 fragt nach der *isolierten* Qualität. Die Differenz v_union({m}) − v_isoliert({m}) ist der **Zeitpunkt-Kredit**, den eine Modalität nur durch die Kandidaten der anderen erhält. |
+| Merkmale je Modalität | 1 Zahl (Max ±1 s) | Punktwert, Max ±0,5/1/2 s, Sessionrang (`fusion.FEATURE_NAMES`) | Der Entscheider kann scharfe Peaks (Video) von breiten Fenstern (Audio) unterscheiden. Identisches Rezept für alle Modalitäten, damit die Shapley-Werte nicht am Aufwand hängen. |
+| Schwelle | fest 0,5 | je Fold auf **Out-of-Bag**-Vorhersagen der Trainingssessions kalibriert (`fusion.choose_threshold`) | Balanced-Gewichtung macht 0,5 nicht F1-optimal; OOB ist leakage-frei und kostet keinen zusätzlichen Fit. |
+| Kopplung | Deckung, Rate, Median-Versatz | zusätzlich **Zufallsdeckung**, **Lift**, **Feinausrichtung (±τ/4)**, **Versatz-IQR**, **Recall-Obergrenze** der Vereinigung, **Entscheidungs-/Vorschlagsverlust** (`coupling.CouplingStats`) | Deckung allein trennt „informativ“ nicht von „definitorisch gekoppelt“; die Feinausrichtung tut es. |
+| Robustheit | nur τ = 1 s | Shapley-Werte für jedes τ des Sweeps und nach Recall statt F1 | Eine Rangfolge, die bei jedem τ hält, ist eine Eigenschaft der Modalitäten, nicht der Bewertung. |
+| Multiplizität | unadjustiert, aber „signifikant“ genannt | je Familie (Shapley, Interaktion, Sättigung) zusätzlich Bonferroni-adjustierte Intervalle | Offenlegung, welche Aussagen als eine von drei bestehen. |
+| Grenzdefinition | nur „Ende“ | zweite Annotation „Beginn“ (Exposé) im Annotationsfenster; Sensitivitätslauf, sobald alle Sessions sie tragen | Prüft, ob der Beitrag an der Definition hängt. |
+
+Der PDF-Bericht (`ui/ReportPdfWriter.py`) und das Fenster zeigen dieselben
+Abschnitte aus `report.sections()`.
+
 ## Schritt 2 — Kandidaten und Merkmale
 
 **Ziel:** Für eine Modalitätskombination S die Zeitpunkte bestimmen, über die
@@ -230,14 +248,22 @@ Ergebnis auf echten Daten existierte — die Git-Historie belegt das.
 
 ```
 evaluation/
-  metrics.py       Matching, Precision/Recall/F1, Nullmodell      Schritt 1  [fertig]
-  dataset.py       Ground Truth und Dauer einer Aufnahme          Schritt 1  [fertig]
-  fusion.py        Kandidaten, Merkmale, Random Forest + Regel     Schritt 2+3 [fertig]
-  experiment.py    LOSO über alle Sessions x 8 Kombinationen       Schritt 3  [fertig]
-  analysis.py      Shapley, Interaktionsindex, Sättigungskurve     Schritt 4  [fertig]
-  statistics.py    Signifikanz, Konfidenzintervalle, Power         Schicht 5  [offen]
-  reliability.py   Intrarater-Auswertung                           Schicht 5  [offen]
+  metrics.py         Matching, Precision/Recall/F1, Nullmodell        Schritt 1  [fertig]
+  dataset.py         Ground Truth und Dauer einer Aufnahme            Schritt 1  [fertig]
+  media.py           ein ffprobe je Aufnahme, geteilt                             [fertig]
+  corpus.py          Inhalt eines Korpusverzeichnisses                            [fertig]
+  fusion.py          Kandidaten, Merkmale, Random Forest              Schritt 2+3 [fertig]
+  coupling.py        Kopplung der Kandidaten mit der Ground Truth                 [fertig]
+  experiment.py      LOSO über alle Sessions x 8 Kombinationen        Schritt 3  [fertig]
+  analysis.py        Shapley, Interaktionsindex, Sättigungskurve      Schritt 4  [fertig]
+  statistics.py      Signifikanz, Konfidenzintervalle, Power          Schicht 5  [fertig]
+  synchronization.py gemessener Uhrenversatz der Modalitäten                     [fertig]
+  report.py          fertige Auswertung + Texte, ohne Qt                          [fertig]
+  reliability.py     Intrarater-Auswertung                            Schicht 5  [offen]
 ```
+
+Die Charakterisierungstests in `tests/` frieren das Verhalten dieser Module
+ein (Goldens aus dem Stand vor dem Refactoring vom 06.09.2026).
 
 ### Festlegungen der Umsetzung
 

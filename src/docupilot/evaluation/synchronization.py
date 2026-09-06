@@ -9,12 +9,12 @@ on a real recording, which is the number the thesis needs rather than a claim.
 
 from __future__ import annotations
 
-import json
-import subprocess
+from collections.abc import Sequence
 from pathlib import Path
 
 import numpy as np
 
+from docupilot.evaluation import media
 from docupilot.recording.session import RecordingSession
 from docupilot.segmentation import video
 
@@ -31,18 +31,51 @@ def stream_offset_ms(recording_path: Path | str) -> float:
     :return: offset in ms (0.0 = streams share the origin), NaN if a stream is
         missing.
     """
-    out = subprocess.run(
-        ["ffprobe", "-v", "error", "-show_entries",
-         "stream=codec_type,start_time", "-of", "json", str(recording_path)],
-        capture_output=True, text=True,
-    ).stdout
-    starts = {
-        s.get("codec_type"): float(s.get("start_time", "nan"))
-        for s in json.loads(out or "{}").get("streams", [])
-    }
+    starts = media.probe(recording_path).stream_start_s
     if "audio" not in starts or "video" not in starts:
         return float("nan")
     return (starts["audio"] - starts["video"]) * 1000.0
+
+
+def rising_edges_s(activity: np.ndarray, times_s: np.ndarray, quiet: float) -> np.ndarray:
+    """
+    The moments the screen goes from still to active.
+
+    A rising EDGE, not merely an active frame: that isolates a click's own
+    reaction from motion already under way, which would otherwise let a click
+    be matched to a change that started before it and pull the estimate negative.
+    """
+    if len(activity) < 2:
+        return np.zeros(0, dtype=np.float64)
+    active = activity >= quiet
+    return times_s[1:][(~active[:-1]) & active[1:]]
+
+
+def reaction_offsets_s(
+    rise_times_s: np.ndarray,
+    click_times_s: Sequence[float],
+    look_back_s: float = 0.3,
+    look_ahead_s: float = 1.5,
+) -> np.ndarray:
+    """
+    Per click, the seconds until the first rising edge near it.
+
+    A click cannot cause a change before it happens, so a clean recording shows a
+    small positive median (UI latency) and no large systematic shift; a large
+    negative median would mean events are logged late relative to the video — a
+    clock desync. The small backward window absorbs exactly that measurement
+    noise without admitting an unrelated earlier change.
+
+    :return: one offset per click that had a following change; empty if none.
+    """
+    offsets: list[float] = []
+    for click in click_times_s:
+        window = rise_times_s[
+            (rise_times_s >= click - look_back_s) & (rise_times_s <= click + look_ahead_s)
+        ]
+        if len(window):
+            offsets.append(float(window[0] - click))
+    return np.asarray(offsets, dtype=np.float64)
 
 
 def click_offsets_s(
@@ -51,41 +84,22 @@ def click_offsets_s(
     """
     Per mouse click, the seconds until the screen first reacts.
 
-    A click cannot cause a change before it happens, so a clean recording shows a
-    small positive median (UI latency) and no large systematic shift; a large
-    negative median would mean events are logged late relative to the video — a
-    clock desync. Uses the same activity signal the video extractor sees, so it
-    measures sync as the pipeline actually experiences it.
-
-    The event a click is matched to is the first quiet->active RISING EDGE in the
-    window, not merely the first active frame: that isolates the click's own
-    reaction from motion already under way, which would otherwise pull the
-    estimate negative.
+    Uses the same activity signal the video extractor sees, so it measures sync
+    as the pipeline actually experiences it — and the same cached scan, so a
+    corpus that was already segmented is not decoded a second time.
 
     :return: one offset per click that had a following change; empty if none.
     """
-    mp4 = str(session.recording_path)
-    n_frames, activity = video._scan(mp4)
-    times_s = video._frame_times_s(mp4, n_frames)
     clicks = [
         e["t_ms"] / 1000.0
         for e in session.input_events()
         if e.get("type") == "mouse_click"
     ]
-    if n_frames < 2 or not clicks:
+    if not clicks:
         return np.zeros(0, dtype=np.float64)
-
-    active = activity >= video._ACTIVITY_QUIET
-    rise_times = times_s[1:][(~active[:-1]) & active[1:]]   # quiet -> active
-
-    offsets: list[float] = []
-    for click in clicks:
-        window = rise_times[
-            (rise_times >= click - look_back_s) & (rise_times <= click + look_ahead_s)
-        ]
-        if len(window):
-            offsets.append(float(window[0] - click))
-    return np.asarray(offsets, dtype=np.float64)
+    scan = video.scan_activity(session)
+    rises = rising_edges_s(scan.activity, scan.times_s, video.ACTIVITY_QUIET)
+    return reaction_offsets_s(rises, clicks, look_back_s, look_ahead_s)
 
 
 def report(session: RecordingSession) -> dict[str, float]:
@@ -102,6 +116,10 @@ def report(session: RecordingSession) -> dict[str, float]:
         "click_median_ms": float(np.median(offsets) * 1000),
         "click_iqr_lo_ms": float(np.percentile(offsets, 25) * 1000),
         "click_iqr_hi_ms": float(np.percentile(offsets, 75) * 1000),
+        # P95 because the τ justification is a coverage claim: "τ covers the
+        # typical latency" must hang on a quantile, not on a maximum that a
+        # single outlier decides.
+        "click_p95_ms": float(np.percentile(offsets, 95) * 1000),
         "click_absmax_ms": float(np.abs(offsets).max() * 1000),
         "n": len(offsets),
     }

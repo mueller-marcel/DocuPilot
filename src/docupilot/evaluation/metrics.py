@@ -84,38 +84,6 @@ def match(gt_s: Sequence[float], pred_s: Sequence[float], tau_s: float) -> Match
     return Match(tp=len(pairs), fp=m - len(pairs), fn=n - len(pairs), pairs=pairs)
 
 
-def sweep(
-    gt_s: Sequence[float], pred_s: Sequence[float], taus_s: Sequence[float]
-) -> dict[float, Match]:
-    """Match at several tolerances at once — the robustness view on one session."""
-    return {float(tau): match(gt_s, pred_s, tau) for tau in taus_s}
-
-
-def macro_f1(matches: Sequence[Match]) -> float:
-    """
-    Mean of the per-session F1 scores — every session counts the same.
-
-    The primary aggregation: sessions are the unit of the experiment, and the
-    per-session values are what the paired statistics later need.
-    """
-    return float(np.mean([m.f1 for m in matches])) if matches else 0.0
-
-
-def pooled(matches: Sequence[Match]) -> Match:
-    """
-    All sessions' counts added up — long sessions weigh more.
-
-    Secondary to `macro_f1`. Carries no pairs: timestamps of different sessions
-    do not share an axis.
-    """
-    return Match(
-        tp=sum(m.tp for m in matches),
-        fp=sum(m.fp for m in matches),
-        fn=sum(m.fn for m in matches),
-        pairs=[],
-    )
-
-
 def chance_level(
     gt_s: Sequence[float],
     duration_s: float,
