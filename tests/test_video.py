@@ -227,6 +227,67 @@ class TestFrameTimes:
             video.parse_frame_times("1.0\n2.0\n", 5)
 
 
+class TestActivityCache:
+    """
+    The stored scan, with the decoder stubbed out.
+
+    What is worth testing here is when a stored scan may be reused, not whether
+    OpenCV can read an MP4 — that is the library's own business and is verified
+    by running the application.
+    """
+
+    @staticmethod
+    def stub(monkeypatch, calls: list, n_frames: int = 5):
+        monkeypatch.setattr(video, "_scan", lambda path: (
+            calls.append(path) or (n_frames, np.linspace(0, 1, n_frames, dtype=np.float32), 10.0)
+        ))
+        monkeypatch.setattr(
+            video, "_frame_times_s", lambda path, n: np.arange(n, dtype=np.float64) / 10.0
+        )
+
+    def test_a_scan_is_stored_and_reused(self, session, monkeypatch):
+        calls: list = []
+        self.stub(monkeypatch, calls)
+
+        first = video.scan_activity(session)
+        assert (session.session_dir / "video_activity.npz").exists()
+        second = video.scan_activity(session)
+
+        assert len(calls) == 1                       # decoded once, not twice
+        assert second.n_frames == first.n_frames and second.fps == first.fps
+        np.testing.assert_array_equal(second.activity, first.activity)
+        np.testing.assert_array_equal(second.times_s, first.times_s)
+
+    def test_a_changed_recording_is_scanned_again(self, session, monkeypatch):
+        calls: list = []
+        self.stub(monkeypatch, calls)
+        video.scan_activity(session)
+        before = video._activity_key(session)
+
+        session.recording_path.write_bytes(b"different bytes")
+        # The key is the recording's CONTENT, so a changed file can never be
+        # served the previous scan.
+        assert video._activity_key(session) != before
+        video.scan_activity(session)
+        assert len(calls) == 2
+
+    def test_a_damaged_store_is_a_miss_never_a_crash(self, session, monkeypatch):
+        calls: list = []
+        self.stub(monkeypatch, calls)
+        video.scan_activity(session)
+        (session.session_dir / "video_activity.npz").write_bytes(b"not an npz")
+        video.scan_activity(session)
+        assert len(calls) == 2
+
+    def test_use_cache_false_neither_reads_nor_writes(self, session, monkeypatch):
+        calls: list = []
+        self.stub(monkeypatch, calls)
+        video.scan_activity(session, use_cache=False)
+        assert not (session.session_dir / "video_activity.npz").exists()
+        video.scan_activity(session, use_cache=False)
+        assert len(calls) == 2
+
+
 class TestExtractGuards:
     def test_extract_refuses_to_run_without_a_backend(self, session, monkeypatch):
         from docupilot.segmentation import video_scoring
@@ -247,3 +308,8 @@ class TestExtractGuards:
         ))
         ev = video.extract(session, use_cache=False)
         assert ev.boundaries_s == [] and not ev.score.any()
+
+    def test_asking_for_no_frames_decodes_nothing(self):
+        # Returns before OpenCV is even imported, so an empty dwell list costs
+        # nothing on a machine without the decoder.
+        assert video._read_frames("does-not-exist.mp4", set()) == {}

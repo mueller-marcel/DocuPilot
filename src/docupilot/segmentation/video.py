@@ -366,13 +366,14 @@ def _read_frames(video_path: str, wanted: set[int]) -> dict[int, np.ndarray]:
     Sequential decoding beats seeking on a long-GOP MP4, and full-size frames
     would hold ~0.5 GB in memory for nothing — the model only sees the downscale.
     """
+    frames: dict[int, np.ndarray] = {}
+    if not wanted:
+        return frames                      # nothing to decode, nothing to import
+
     import cv2
 
     from docupilot.segmentation.video_scoring import downscale
 
-    frames: dict[int, np.ndarray] = {}
-    if not wanted:
-        return frames
     cap = cv2.VideoCapture(video_path)
     if not cap.isOpened():
         return frames

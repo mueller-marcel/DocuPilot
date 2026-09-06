@@ -198,3 +198,43 @@ class TestCorpusScan:
         (cached / "gui_vlm_cache.json").write_text("{}", encoding="utf-8")
         # The count is what warns about the model cost of the next run.
         assert corpus.scan(tmp_path).without_video_cache == 1
+
+    def test_one_session_cannot_be_evaluated(self, tmp_path):
+        write_session(tmp_path / "session_a", ground_truth=[{"t_ms": 1.0}])
+        # Leave-one-session-out has no fold that excludes the scored session.
+        assert not corpus.scan(tmp_path).can_evaluate
+        write_session(tmp_path / "session_b", ground_truth=[{"t_ms": 1.0}])
+        assert corpus.scan(tmp_path).can_evaluate
+
+
+class TestCorpusDescription:
+    """The summary line the window shows; here so its wording needs no display."""
+
+    def test_it_names_the_usable_count_and_what_was_skipped(self, tmp_path):
+        write_session(tmp_path / "session_a", ground_truth=[{"t_ms": 1.0}])
+        write_session(tmp_path / "session_b")
+        text = corpus.describe(corpus.scan(tmp_path))
+        assert "1 Sessions verwendbar" in text
+        assert "1 ohne Ground Truth übersprungen" in text
+
+    def test_it_warns_about_model_cost_only_when_a_cache_is_missing(self, tmp_path):
+        directory = tmp_path / "session_a"
+        write_session(directory, ground_truth=[{"t_ms": 1.0}])
+        assert "ohne Video-Cache" in corpus.describe(corpus.scan(tmp_path))
+        (directory / "gui_vlm_cache.json").write_text("{}", encoding="utf-8")
+        assert "keine Modellkosten" in corpus.describe(corpus.scan(tmp_path))
+
+    def test_it_says_whether_the_sensitivity_run_can_happen(self, tmp_path):
+        write_session(tmp_path / "session_a", ground_truth=[{"t_ms": 1.0}])
+        assert "kein Sensitivitätslauf" in corpus.describe(corpus.scan(tmp_path))
+        write_session(tmp_path / "session_b", ground_truth=[
+            {"t_ms": 1.0}, {"t_ms": 2.0, "kind": "start"},
+        ])
+        write_session(tmp_path / "session_a", ground_truth=[
+            {"t_ms": 1.0}, {"t_ms": 2.0, "kind": "start"},
+        ])
+        assert "Sensitivitätslauf aktiv" in corpus.describe(corpus.scan(tmp_path))
+
+    def test_a_corpus_too_small_to_score_says_so(self, tmp_path):
+        write_session(tmp_path / "session_a", ground_truth=[{"t_ms": 1.0}])
+        assert "mindestens zwei Sessions" in corpus.describe(corpus.scan(tmp_path))

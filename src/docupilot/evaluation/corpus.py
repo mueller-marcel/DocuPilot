@@ -62,6 +62,45 @@ class CorpusScan:
         usable = [s for s in self.sessions if s.annotated]
         return bool(usable) and all(s.n_start_boundaries > 0 for s in usable)
 
+    @property
+    def can_evaluate(self) -> bool:
+        """
+        Whether the corpus supports leave-one-session-out at all.
+
+        One session cannot provide a fold that excludes the session being
+        scored, so the run is refused rather than faked.
+        """
+        return len(self.usable) >= 2
+
+
+def describe(scan: CorpusScan) -> str:
+    """
+    One line stating what the corpus offers and what it will cost — the text the
+    window shows above the session table.
+
+    Here rather than in the widget so the wording is testable without a display,
+    and so a script can print the same summary.
+    """
+    usable = len(scan.usable)
+    skipped = len(scan.sessions) - usable
+    parts = [f"{scan.root}  ·  {usable} Sessions verwendbar"]
+    if skipped:
+        parts.append(f"{skipped} ohne Ground Truth übersprungen")
+    parts.append(
+        f"⚠ {scan.without_video_cache} ohne Video-Cache — dieser Lauf erzeugt neue "
+        f"VLM-Aufrufe (Größenordnung ~50 je Session)"
+        if scan.without_video_cache else
+        "vollständig gecacht, keine Modellkosten"
+    )
+    parts.append(
+        "Definition \"Beginn\" vollständig annotiert — Sensitivitätslauf aktiv"
+        if scan.start_definition_available else
+        "Definition \"Beginn\" nicht in allen Sessions annotiert — kein Sensitivitätslauf"
+    )
+    if not scan.can_evaluate:
+        parts.append("⚠ mindestens zwei Sessions nötig (Leave-one-session-out)")
+    return "  ·  ".join(parts)
+
 
 def _count_kinds(ground_truth: Path) -> tuple[int, int]:
     """(end, start) boundary counts of one ground_truth.json."""

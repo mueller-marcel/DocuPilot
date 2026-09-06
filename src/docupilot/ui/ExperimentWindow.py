@@ -292,25 +292,9 @@ class ExperimentWindow(QDialog):
                     item.setForeground(Qt.GlobalColor.red)
                 self._table.setItem(row, column, item)
 
-        usable = len(self._directories)
-        no_gt = len(scanned.sessions) - usable
-        without_cache = scanned.without_video_cache
-        self._corpus_label.setText(
-            f"{root}  ·  {usable} Sessions verwendbar"
-            + (f"  ·  {no_gt} ohne Ground Truth übersprungen" if no_gt else "")
-            + (f"  ·  ⚠ {without_cache} ohne Video-Cache — dieser Lauf erzeugt "
-               f"neue VLM-Aufrufe (Größenordnung ~50 je Session)"
-               if without_cache else "  ·  vollständig gecacht, keine Modellkosten")
-            + ("  ·  Definition \"Beginn\" vollständig annotiert — Sensitivitätslauf aktiv"
-               if self._start_definition else
-               "  ·  Definition \"Beginn\" nicht in allen Sessions annotiert — kein Sensitivitätslauf")
-            # LOSO needs a fold that excludes the scored session; one session
-            # cannot provide one, so the run is refused rather than faked.
-            + ("  ·  ⚠ mindestens zwei Sessions nötig (Leave-one-session-out)"
-               if usable < 2 else "")
-        )
-        self._run_button.setEnabled(usable >= 2)
-        return usable
+        self._corpus_label.setText(corpus.describe(scanned))
+        self._run_button.setEnabled(scanned.can_evaluate)
+        return len(self._directories)
 
     # ── Run ──────────────────────────────────────────────────────────────
 

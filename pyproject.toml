@@ -8,7 +8,10 @@ dependencies = [
     "pyside6>=6.7",
     "mss (>=10.2.0,<11.0.0)",
     "pynput (>=1.8.1,<2.0.0)",
-    "opencv-python (>=4.13.0.92,<5.0.0.0)",
+    # headless: OpenCV is used for image processing only, never to open a
+    # window. The GUI build additionally links libGL and friends, which a
+    # server, a container or a CI runner does not have.
+    "opencv-python-headless (>=4.13.0.92,<5.0.0.0)",
     "imagehash (>=4.3.2,<5.0.0)",
     "pillow (>=12.2.0,<13.0.0)",
     "librosa (>=0.11.0,<0.12.0)",
