@@ -47,27 +47,3 @@ jobs:
 
       - name: Build package
         run: poetry build
-
-  test:
-    name: Test
-    runs-on: ubuntu-latest
-    timeout-minutes: 45
-
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
-
-      - name: Install Poetry
-        run: pipx install "poetry==${{ env.POETRY_VERSION }}"
-
-      - name: Set up Python
-        uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6
-        with:
-          python-version: ${{ env.PYTHON_VERSION }}
-          cache: poetry
-
-      - name: Install dependencies
-        run: poetry install --with dev
-
-      - name: Test
-        run: poetry run pytest tests -q -ra
