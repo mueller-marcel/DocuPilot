@@ -6,41 +6,98 @@ on:
   push:
     branches: ["main"]
 
+# A newer push supersedes the run before it on the same branch; keeping the old
+# one alive only queues work whose answer nobody will read.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+# Nothing here writes to the repository.
+permissions:
+  contents: read
+
+env:
+  PYTHON_VERSION: "3.14"
+  POETRY_VERSION: "2.3.0"
+  POETRY_NO_INTERACTION: "1"
+
 jobs:
-  quality:
+  # Everything that needs neither the dependency tree nor a display. Runs in
+  # parallel with the tests, so a lint error or a stale lock file is reported in
+  # under a minute instead of after the multi-gigabyte install below.
+  static:
+    name: Lint and package
     runs-on: ubuntu-latest
+    timeout-minutes: 15
 
     steps:
       - name: Checkout repository
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
 
+      - name: Install Poetry
+        run: pipx install "poetry==${{ env.POETRY_VERSION }}"
+
       - name: Set up Python
         uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6
         with:
-          python-version: "3.14"
-
-      - name: Install Poetry
-        run: python -m pip install --upgrade pip && python -m pip install "poetry==2.3.0"
+          python-version: ${{ env.PYTHON_VERSION }}
 
       - name: Validate Poetry configuration
         run: poetry check --lock
 
-      - name: Install dependencies
-        run: poetry install --with dev
+      # Only the dev group: ruff and the test tooling are a few megabytes, while
+      # the project's own dependencies are gigabytes and are not needed to lint.
+      - name: Install lint tooling
+        run: poetry install --only dev --no-root
 
       - name: Lint
         run: poetry run ruff check .
 
-      - name: Install system libraries for Qt and ffmpeg
+      - name: Build package
+        run: poetry build
+
+  test:
+    name: Test
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+
+      # Before setup-python, so its Poetry cache can find the tool it caches for.
+      - name: Install Poetry
+        run: pipx install "poetry==${{ env.POETRY_VERSION }}"
+
+      - name: Set up Python
+        uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          # Keyed on poetry.lock. Torch, OpenCV, Whisper and the 500 MB German
+          # spaCy model would otherwise be downloaded on every single run. Only
+          # this job caches: the lint job installs a different, much smaller set
+          # under the same lock file and would poison the entry.
+          cache: poetry
+
+      # The UI tests build real Qt widgets and the media adapter tests decode a
+      # clip they generate. A runner has neither a display nor ffmpeg, and both
+      # suites would skip themselves rather than fail — a green run that tested
+      # nothing. OpenCV additionally needs libGL even when it never shows a window.
+      - name: Install system libraries for Qt, OpenCV and ffmpeg
         run: |
           sudo apt-get update
           sudo apt-get install --yes --no-install-recommends \
-            ffmpeg libegl1 libgl1 libxkbcommon-x11-0 libdbus-1-3
+            ffmpeg libegl1 libgl1 libglib2.0-0 libxkbcommon-x11-0 libdbus-1-3
+
+      - name: Install dependencies
+        run: poetry install --with dev
 
       - name: Test
         env:
+          # Qt renders into a buffer; conftest sets the same default so a local
+          # run behaves identically.
           QT_QPA_PLATFORM: offscreen
+        # -ra lists every skip with its reason, so a suite that stopped running
+        # because a tool went missing shows up in the log instead of passing
+        # quietly.
         run: poetry run pytest tests -q -ra
-
-      - name: Build package
-        run: poetry build
