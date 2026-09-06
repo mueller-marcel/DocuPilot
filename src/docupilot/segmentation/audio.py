@@ -8,7 +8,9 @@ announces steps in order, so step i completed between announcement i and i+1.
 
 from __future__ import annotations
 
-from collections.abc import Callable
+import threading
+from bisect import bisect_right
+from collections.abc import Callable, Sequence
 
 import numpy as np
 
@@ -37,30 +39,57 @@ _COMPLETION_POSITION = 0.75
 # and there is no announcement gap to take a median of.
 _LAST_WINDOW_FALLBACK_S = 8.0
 
-
-def _transcribe(session: RecordingSession) -> tuple[str, list[dict]]:
-    """Whisper transcript plus word-level timestamps. Reads only the audio track."""
-    import whisper
-
-    result = whisper.load_model(_WHISPER_MODEL).transcribe(
-        str(session.recording_path),
-        verbose=False,
-        language="de",
-        word_timestamps=True,
-        condition_on_previous_text=False,
-    )
-    words = [w for seg in result.get("segments", []) for w in seg.get("words", [])]
-    return result.get("text", "").strip(), words
+# Loaded models, one set PER THREAD. Whisper and spaCy take a minute to load
+# and a corpus run transcribes 25 recordings, so reloading per session was the
+# single largest avoidable cost of this modality. Per thread rather than per
+# process because two segmentation runs may overlap (feature dialog and
+# experiment window each own a worker) and Whisper's decode installs hooks on
+# the model it runs on — sharing one instance across threads would let the
+# runs corrupt each other's decode.
+_MODELS = threading.local()
 
 
-def _sentences(full_text: str, words: list[dict]) -> list[tuple[float, str]]:
-    """Split the transcript into (t_s, text) sentences using spaCy."""
-    if not full_text or not words:
-        return []
+def _keep_attention_weights() -> None:
+    """
+    Make Whisper materialise its cross-attention weights for the whole process.
+
+    Word timestamps are read off those weights, and the fused SDPA kernel never
+    returns them (`qk` stays None). Whisper switches SDPA off around the alignment
+    pass itself, but the switch is a CLASS attribute — process-wide and not
+    thread-safe. Two segmentation runs overlap here (the feature dialog and the
+    experiment window each own a worker thread), so one run restores SDPA while
+    the other is still aligning, and the alignment then indexes None:
+    "'NoneType' object is not subscriptable". Off once, no window; the explicit
+    attention path is the one Whisper used before SDPA existed.
+    """
+    from whisper.model import MultiHeadAttention
+
+    MultiHeadAttention.use_sdpa = False
+
+
+def _whisper_model():
+    """This thread's Whisper model, loaded on first use."""
+    model = getattr(_MODELS, "whisper", None)
+    if model is None:
+        import whisper
+
+        model = whisper.load_model(_WHISPER_MODEL)
+        _MODELS.whisper = model
+    return model
+
+
+def _nlp():
+    """
+    This thread's German spaCy pipeline, loaded on first use.
+
+    :raises OSError: when no German model is installed.
+    """
+    nlp = getattr(_MODELS, "nlp", None)
+    if nlp is not None:
+        return nlp
 
     import spacy
 
-    nlp = None
     for name in _SPACY_MODELS:
         try:
             nlp = spacy.load(name)
@@ -72,11 +101,46 @@ def _sentences(full_text: str, words: list[dict]) -> list[tuple[float, str]]:
             "Kein deutsches spaCy-Modell gefunden. Bitte installieren:\n"
             "  python -m spacy download de_core_news_lg"
         )
+    _MODELS.nlp = nlp
+    return nlp
+
+
+def _transcribe(session: RecordingSession) -> tuple[str, list[dict]]:
+    """Whisper transcript plus word-level timestamps. Reads only the audio track."""
+    _keep_attention_weights()
+
+    result = _whisper_model().transcribe(
+        str(session.recording_path),
+        verbose=False,
+        language="de",
+        word_timestamps=True,
+        condition_on_previous_text=False,
+        # A SCALAR, not Whisper's default (0.0, 0.2, ... 1.0): the tuple is a
+        # fallback chain that re-decodes a segment at rising temperature when it
+        # looks repetitive or low-confidence, and every temperature above 0 draws
+        # tokens by SAMPLING. Two runs of the same recording then yield different
+        # transcripts, different sentences, a different verdict-cache key and
+        # therefore different audio evidence — the modality would not be
+        # reproducible. At 0 the decoder is a deterministic argmax.
+        temperature=0.0,
+    )
+    words = [w for seg in result.get("segments", []) for w in seg.get("words", [])]
+    return result.get("text", "").strip(), words
+
+
+def _sentences(full_text: str, words: list[dict]) -> list[tuple[float, str]]:
+    """Split the transcript into (t_s, text) sentences using spaCy."""
+    if not full_text or not words:
+        return []
+
+    nlp = _nlp()
 
     # Char offset -> timestamp, from the Whisper word list. The cursor advances
     # past each match so a repeated word maps to its own occurrence rather than
-    # always the first one.
-    char_to_time: list[tuple[int, float]] = []
+    # always the first one; as a consequence the offsets are strictly ascending,
+    # which is what lets a sentence start be looked up by bisection.
+    positions: list[int] = []
+    starts: list[float] = []
     cursor = 0
     for w in words:
         surface = w.get("word", "").strip()
@@ -84,23 +148,56 @@ def _sentences(full_text: str, words: list[dict]) -> list[tuple[float, str]]:
             continue
         pos = full_text.find(surface, cursor)
         if pos != -1:
-            char_to_time.append((pos, float(w.get("start", 0.0))))
+            positions.append(pos)
+            starts.append(float(w.get("start", 0.0)))
             cursor = pos + len(surface)
 
     def _time_at(char_idx: int) -> float:
-        if not char_to_time:
+        # The last word starting at or before the sentence; a sentence that
+        # begins before any matched word inherits the first word's time.
+        if not positions:
             return 0.0
-        best = char_to_time[0][1]
-        for pos, t in char_to_time:
-            if pos > char_idx:
-                break
-            best = t
-        return best
+        index = bisect_right(positions, char_idx) - 1
+        return starts[index] if index >= 0 else starts[0]
 
     return [
         (_time_at(sent.start_char), sent.text.strip())
         for sent in nlp(full_text).sents
         if sent.text.strip()
+    ]
+
+
+def execution_windows(
+    starts_s: Sequence[float], duration_s: float
+) -> list[tuple[float, float, float]]:
+    """
+    The interval each announcement opens, and where inside it the completion is
+    expected: (start, end, peak) per sentence, in seconds.
+
+    This is the whole geometric argument of the modality. The speaker announces
+    steps IN ORDER and carries them out afterwards, so step *i* completes
+    somewhere between announcement *i* and announcement *i+1* — audio knows the
+    interval, never the instant. Putting a narrow peak on the sentence onset
+    would fake a precision the modality does not have, and the Shapley value
+    would then measure that geometry instead of the modality.
+
+    The last window has no following announcement to close it and is closed by
+    this session's own MEDIAN announcement gap (a fast speaker gets a shorter
+    one), at the latest by the end of the recording.
+
+    :param starts_s: sentence onsets in seconds, ascending.
+    :param duration_s: length of the recording.
+    :return: one (start, end, peak) per sentence; windows that would be empty
+        are still returned and rejected by the caller.
+    """
+    if not starts_s:
+        return []
+    gaps = np.diff(starts_s)
+    horizon = float(np.median(gaps)) if len(gaps) else _LAST_WINDOW_FALLBACK_S
+    ends = [*starts_s[1:], min(starts_s[-1] + horizon, duration_s)]
+    return [
+        (start, end, start + _COMPLETION_POSITION * (end - start))
+        for start, end in zip(starts_s, ends)
     ]
 
 
@@ -167,22 +264,17 @@ def extract(
     if on_progress is not None:
         on_progress(2, 2)
 
-    # The last window is closed by this session's own median announcement gap or
-    # by the recording's end, whichever comes first.
-    starts_s = [t_s for t_s, _ in sentences]
-    gaps = np.diff(starts_s)
-    horizon = float(np.median(gaps)) if len(gaps) else _LAST_WINDOW_FALLBACK_S
-    window_ends = [*starts_s[1:], min(starts_s[-1] + horizon, duration_s)]
+    windows = execution_windows([t_s for t_s, _ in sentences], duration_s)
 
     boundaries_s: list[float] = []
-    for start_s, end_s, judgement in zip(starts_s, window_ends, judgements):
+    for (start_s, end_s, peak_s), judgement in zip(windows, judgements):
         if end_s <= start_s:                  # spaCy split, same Whisper word
             continue
         peak = apply_window(
             score,
             lo=int(round(start_s * GRID_HZ)),
             hi=int(round(end_s * GRID_HZ)),
-            peak=int(round((start_s + _COMPLETION_POSITION * (end_s - start_s)) * GRID_HZ)),
+            peak=int(round(peak_s * GRID_HZ)),
             value=judgement.p_boundary,
         )
         if judgement.p_boundary >= BOUNDARY_THRESHOLD:

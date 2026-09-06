@@ -1,14 +1,14 @@
 from __future__ import annotations
 
 from PySide6.QtCore import QPointF, QRectF, Qt
-from PySide6.QtGui import QColor, QFont, QPainter, QPen
+from PySide6.QtGui import QColor, QPainter, QPen
 from PySide6.QtWidgets import QWidget
 
-_BACKGROUND = "#1e1e2e"
-_AXIS = "#44445a"
-_TEXT = "#ddd"
-_MUTED = "#888"
-_LINE = "#34d399"
+from docupilot.ui.widgets.chart_style import (
+    AXIS, BACKGROUND, MUTED, TEXT, paint_placeholder, small_fonts,
+)
+
+_LINE = "#059669"
 
 _MARGIN_LEFT = 46
 _MARGIN_RIGHT = 18
@@ -31,7 +31,7 @@ class SaturationChartWidget(QWidget):
         self._gains: dict[int, float] = {}
         self._threshold: float | None = None
         self.setMinimumHeight(190)
-        self.setStyleSheet(f"background:{_BACKGROUND};")
+        self.setStyleSheet(f"background:{BACKGROUND};")
 
     def set_values(
         self,
@@ -52,13 +52,11 @@ class SaturationChartWidget(QWidget):
     def paintEvent(self, event) -> None:
         painter = QPainter(self)
         painter.setRenderHint(QPainter.RenderHint.Antialiasing)
-        painter.fillRect(self.rect(), QColor(_BACKGROUND))
 
         if not self._curve:
-            painter.setPen(QColor(_MUTED))
-            painter.drawText(self.rect(), Qt.AlignmentFlag.AlignCenter,
-                             "Noch keine Auswertung")
+            paint_placeholder(painter, self.rect())
             return
+        painter.fillRect(self.rect(), QColor(BACKGROUND))
 
         left, top = _MARGIN_LEFT, _MARGIN_TOP
         right = self.width() - _MARGIN_RIGHT
@@ -70,21 +68,18 @@ class SaturationChartWidget(QWidget):
             x = left + (right - left) * counts.index(k) / steps
             return QPointF(x, bottom - (bottom - top) * self._curve[k])
 
-        small = QFont(self.font())
-        small.setPointSize(9)
-        tiny = QFont(small)
-        tiny.setPointSize(8)
+        small, tiny = small_fonts(self.font())
 
-        painter.setPen(QPen(QColor(_AXIS), 1))
+        painter.setPen(QPen(QColor(AXIS), 1))
         painter.drawLine(left, top, left, bottom)
         painter.drawLine(left, bottom, right, bottom)
 
         painter.setFont(tiny)
         for tick in (0.0, 0.25, 0.5, 0.75, 1.0):
             y = bottom - (bottom - top) * tick
-            painter.setPen(QPen(QColor(_AXIS), 1, Qt.PenStyle.DotLine))
+            painter.setPen(QPen(QColor(AXIS), 1, Qt.PenStyle.DotLine))
             painter.drawLine(left, int(y), right, int(y))
-            painter.setPen(QColor(_MUTED))
+            painter.setPen(QColor(MUTED))
             painter.drawText(QRectF(2, y - 8, _MARGIN_LEFT - 8, 16),
                              int(Qt.AlignmentFlag.AlignRight), f"{tick:.2f}")
 
@@ -99,11 +94,11 @@ class SaturationChartWidget(QWidget):
             painter.drawEllipse(centre, 4.5, 4.5)
 
             painter.setFont(small)
-            painter.setPen(QColor(_TEXT))
+            painter.setPen(QColor(TEXT))
             painter.drawText(QRectF(centre.x() - 34, centre.y() - 26, 68, 16),
                              int(Qt.AlignmentFlag.AlignHCenter), f"{self._curve[k]:.3f}")
             painter.setFont(tiny)
-            painter.setPen(QColor(_MUTED))
+            painter.setPen(QColor(MUTED))
             painter.drawText(QRectF(centre.x() - 34, bottom + 6, 68, 16),
                              int(Qt.AlignmentFlag.AlignHCenter),
                              f"{k} Modalität" + ("" if k == 1 else "en"))
@@ -116,7 +111,7 @@ class SaturationChartWidget(QWidget):
                 continue
             start, end = point_of(k - 1), point_of(k)
             relevant = self._threshold is None or abs(gain) >= self._threshold
-            painter.setPen(QColor(_LINE) if relevant else QColor(_MUTED))
+            painter.setPen(QColor(_LINE) if relevant else QColor(MUTED))
             painter.drawText(
                 QRectF((start.x() + end.x()) / 2 - 40,
                        (start.y() + end.y()) / 2 + 6, 80, 16),
@@ -126,7 +121,7 @@ class SaturationChartWidget(QWidget):
 
         if self._threshold is not None:
             painter.setFont(tiny)
-            painter.setPen(QColor(_MUTED))
+            painter.setPen(QColor(MUTED))
             painter.drawText(
                 QRectF(left, bottom + 22, right - left, 16),
                 int(Qt.AlignmentFlag.AlignRight),

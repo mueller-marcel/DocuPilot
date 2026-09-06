@@ -12,6 +12,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from docupilot.recording.session import RecordingSession
 from docupilot.ui.formatting import format_ms
 
 
@@ -73,7 +74,8 @@ class BoundaryDialog(QDialog):
         for i, b in enumerate(self._boundaries):
             t_ms = b.get("t_ms", 0.0)
             created = b.get("created_at_utc", "")[:19].replace("T", "  ")
-            item = QListWidgetItem(f"#{i + 1}   {format_ms(t_ms)}   —   {created} UTC")
+            kind = "Beginn" if RecordingSession.boundary_kind(b) == "start" else "Ende  "
+            item = QListWidgetItem(f"#{i + 1}   {kind}   {format_ms(t_ms)}   —   {created} UTC")
             item.setData(Qt.ItemDataRole.UserRole, i)
             self._list.addItem(item)
 

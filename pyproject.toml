@@ -8,7 +8,10 @@ dependencies = [
     "pyside6>=6.7",
     "mss (>=10.2.0,<11.0.0)",
     "pynput (>=1.8.1,<2.0.0)",
-    "opencv-python (>=4.13.0.92,<5.0.0.0)",
+    # headless: OpenCV is used for image processing only, never to open a
+    # window. The GUI build additionally links libGL and friends, which a
+    # server, a container or a CI runner does not have.
+    "opencv-python-headless (>=4.13.0.92,<5.0.0.0)",
     "imagehash (>=4.3.2,<5.0.0)",
     "pillow (>=12.2.0,<13.0.0)",
     "librosa (>=0.11.0,<0.12.0)",
@@ -19,6 +22,12 @@ dependencies = [
     "scipy (>=1.18,<2.0)",
     "scikit-learn (>=1.9,<2.0)",
     "anthropic (>=0.116,<1.0)",
+    # spaCy's CLI does `from click import NoSuchOption` and used to get click
+    # through typer. Since typer 0.27 that is no longer a dependency, so
+    # importing spacy at all fails unless click is installed explicitly.
+    # Declared here rather than left to chance, which is what hid the problem
+    # on a developer machine where click came from somewhere else.
+    "click (>=8.1,<9.0)",
 ]
 
 [project.scripts]
@@ -30,6 +39,9 @@ packages = [{ include = "docupilot", from = "src" }]
 [dependency-groups]
 dev = [
     "ruff>=0.15,<0.16",
+    "pytest>=9.0,<10",
+    # Reads back the generated report to check it is paginated.
+    "pypdf>=5.0,<7.0",
 ]
 
 [build-system]

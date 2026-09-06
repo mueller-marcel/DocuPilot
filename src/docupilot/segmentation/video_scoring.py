@@ -14,42 +14,10 @@ import json
 import os
 import re
 from dataclasses import dataclass
-from pathlib import Path
 
 import numpy as np
 
-def _load_dotenv() -> None:
-    """
-    Read KEY=VALUE lines from the project's .env into the environment. Never
-    overwrites an already-set variable: the real environment wins.
-
-    The root is found by looking upwards for pyproject.toml rather than by a
-    fixed number of levels — a fixed one quietly stopped matching when the
-    package moved under src/, and a missing key looks exactly like a missing
-    .env.
-    """
-    root = next(
-        (d for d in Path(__file__).resolve().parents if (d / "pyproject.toml").exists()),
-        None,
-    )
-    if root is None:
-        return
-    env_file = root / ".env"
-    if not env_file.exists():
-        return
-    try:
-        # utf-8-sig: PowerShell writes a BOM that would stick to the first key.
-        for line in env_file.read_text(encoding="utf-8-sig").splitlines():
-            line = line.strip()
-            if not line or line.startswith("#") or "=" not in line:
-                continue
-            key, _, value = line.partition("=")
-            os.environ.setdefault(key.strip(), value.strip().strip('"').strip("'"))
-    except OSError:
-        pass
-
-
-_load_dotenv()
+from docupilot.segmentation import backend
 
 # The model is env-driven so a faster/cheaper one (e.g. Haiku 4.5,
 # claude-haiku-4-5-20251001) can be A/B-tested without a code edit. Different
@@ -66,6 +34,10 @@ _HALF_WIDTH = 896
 _BANNER_H = 34
 _GAP = 12
 _JPEG_QUALITY = 80
+
+# A zoom row only helps when the change is SMALL. Above this share of the
+# screen the crop is the frame again — pure token cost.
+_ZOOM_MAX_AREA = 0.35
 
 _BOUNDARY = "ACTION_COMPLETED"
 _CATEGORIES = (
@@ -164,9 +136,9 @@ class Judgement:
     reason: str = ""    # the model's own observation — keep it: it is how you
                         # tell "saw nothing, guessed a label" from a real read
 
-    @property
-    def is_boundary(self) -> bool:
-        return self.category == _BOUNDARY
+
+# The one boundary decision rule lives downstream (BOUNDARY_THRESHOLD on
+# p_boundary) — deliberately no category-based second rule here.
 
 
 # The JSON the model must return. The API enforces it (structured outputs), so an
@@ -185,41 +157,14 @@ _SCHEMA = {
 
 # ── Cloud model ───────────────────────────────────────────────────────────────
 
-def is_available() -> bool:
-    """True iff the cloud model can actually be called right now."""
-    try:
-        import anthropic  # noqa: F401
-    except ImportError:
-        return False
-    # Constructing the client is not enough — it succeeds without credentials
-    # and only fails on the first request. Check that one actually resolved.
-    try:
-        client = _client()
-    except Exception:
-        return False
-    return bool(getattr(client, "api_key", None) or getattr(client, "auth_token", None))
-
-
-_ANTHROPIC_CLIENT = None
-
-
-def _client():
-    global _ANTHROPIC_CLIENT
-    if _ANTHROPIC_CLIENT is None:
-        import anthropic
-        _ANTHROPIC_CLIENT = anthropic.Anthropic()
-    return _ANTHROPIC_CLIENT
+is_available = backend.is_available
 
 
 def ask(composite: bytes, model: str = MODEL) -> str:
     """Send one BEFORE|AFTER composite to the model and return its raw answer."""
-    return _ask_anthropic(composite, model)
-
-
-def _ask_anthropic(composite: bytes, model: str) -> str:
     # Thinking room for the fine-grained visual comparison; low effort because the
     # output is one small JSON object. max_tokens covers thinking AND the answer.
-    message = _client().messages.create(
+    message = backend.client().messages.create(
         model=model,
         max_tokens=4000,
         system=_SYSTEM,
@@ -251,7 +196,7 @@ def _ask_anthropic(composite: bytes, model: str) -> str:
         # it. Fail loudly instead of quietly emitting an empty lane.
         raise RuntimeError(
             "Antwort wurde von max_tokens abgeschnitten — Thinking-Budget zu klein. "
-            "max_tokens in _ask_anthropic erhöhen."
+            "max_tokens in video_scoring.ask erhöhen."
         )
     return "".join(b.text for b in message.content if b.type == "text")
 
@@ -287,6 +232,8 @@ def parse(raw: str) -> Judgement | None:
         reason=str(data.get("observation", data.get("reason", "")))[:120],
     )
 
+
+# ── Composite image ───────────────────────────────────────────────────────────
 
 def downscale(bgr: np.ndarray) -> np.ndarray:
     """Shrink one frame to _HALF_WIDTH — done once per settled state, then reused."""
@@ -340,11 +287,9 @@ def encode_pair(before: np.ndarray, after: np.ndarray,
     half_w = before.shape[1]
     rows = [(before, after)]
 
-    # A zoom row only helps when the change is SMALL. When the box covers most of
-    # the screen (a window opening) the crop is the frame again — pure token cost.
     if region is not None:
         x0, y0, x1, y1 = region
-        if (x1 - x0) * (y1 - y0) < 0.35:
+        if (x1 - x0) * (y1 - y0) < _ZOOM_MAX_AREA:
             zoom_b = _crop(before, region)
             zoom_a = _crop(after, region)
             scale = half_w / max(zoom_b.shape[1], 1)
@@ -377,22 +322,12 @@ def encode_pair(before: np.ndarray, after: np.ndarray,
 
 # ── Cache ─────────────────────────────────────────────────────────────────────
 
-class Cache:
+class Cache(backend.JsonVerdictCache):
     """
-    Verdicts cached beside the recording, keyed by the CONTENT of the frame pair
-    (plus model and prompt version). Re-encoding the video or re-tuning the
-    proposal stage therefore costs nothing: the same two frames reuse the same
-    verdict.
+    Verdicts keyed by the CONTENT of the frame pair (plus model and prompt
+    version). Re-encoding the video or re-tuning the proposal stage therefore
+    costs nothing: the same two frames reuse the same verdict.
     """
-
-    def __init__(self, path: Path) -> None:
-        self._path = path
-        self._entries: dict[str, dict] = {}
-        if path.exists():
-            try:
-                self._entries = json.loads(path.read_text(encoding="utf-8"))
-            except (OSError, json.JSONDecodeError):
-                pass
 
     @staticmethod
     def key(composite: bytes, model: str) -> str:
@@ -401,9 +336,7 @@ class Cache:
         return h.hexdigest()
 
     def get(self, key: str) -> Judgement | None:
-        """A malformed entry is a cache miss, never a crash — the file is on disk
-        and may predate a change to Judgement."""
-        e = self._entries.get(key)
+        e = self._raw(key)
         if not isinstance(e, dict):
             return None
         try:
@@ -416,18 +349,9 @@ class Cache:
             return None
 
     def put(self, key: str, j: Judgement) -> None:
-        self._entries[key] = {
+        self._store(key, {
             "category": j.category, "p_boundary": j.p_boundary, "reason": j.reason
-        }
-
-    def flush(self) -> None:
-        try:
-            self._path.parent.mkdir(parents=True, exist_ok=True)
-            self._path.write_text(
-                json.dumps(self._entries, ensure_ascii=False, indent=1), encoding="utf-8"
-            )
-        except OSError:
-            pass
+        })
 
 
 def judge(composite: bytes, cache: Cache | None = None,

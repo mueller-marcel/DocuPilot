@@ -81,8 +81,10 @@ class AvRecorder:
             "height": geo.height(),
         }
         with mss.mss() as sct:
-            # Arm before the first grab: t_ms=0 is the logical start of frame 0,
-            # the same origin ffmpeg's wall-clock timestamps normalise to.
+            # Arm just before the first grab so events and video share an origin.
+            # ffmpeg stamps frame 0 a few ms later (when it reads it from the
+            # pipe); that small, constant offset — ~40 ms median on the pilot — is
+            # the residual, not a true zero. Measured in evaluation.synchronization.
             self._session.arm(time.monotonic_ns())
 
             while not self._stop.is_set():
@@ -91,11 +93,13 @@ class AvRecorder:
                 bgra = np.frombuffer(screenshot.raw, dtype=np.uint8).reshape(
                     screenshot.height, screenshot.width, 4
                 )
-                bgr = bgra[:, :, :3].copy()
+                # tobytes() on the strided view already produces a packed BGR
+                # copy; an explicit .copy() first would touch every frame twice.
+                bgr_bytes = bgra[:, :, :3].tobytes()
 
                 try:
                     if self._proc and self._proc.stdin:
-                        self._proc.stdin.write(bgr.tobytes())
+                        self._proc.stdin.write(bgr_bytes)
                         self._proc.stdin.flush()
                 except (BrokenPipeError, OSError):
                     break
@@ -128,10 +132,13 @@ class AvRecorder:
         out = str(self._session.recording_path)
         sys = platform.system()
 
-        # -use_wallclock_as_timestamps stamps each piped frame with the real time
-        # ffmpeg reads it (NOT an assumed rate), and -fps_mode vfr keeps those
-        # timestamps in the file. The video timeline is then real time — the same
-        # clock the events run on — so the two need no reconciliation afterwards.
+        # -use_wallclock_as_timestamps stamps each piped frame with ffmpeg's wall
+        # clock at read time (NOT an assumed rate); -fps_mode vfr keeps those
+        # timestamps. Events run on time.monotonic() zeroed at arm() just before
+        # frame 0, so the two axes share an origin to within the pipe start-up
+        # latency (measured ~40 ms, well inside the matching tolerance). They are
+        # different clock families, so a wall-clock step (NTP) mid-recording would
+        # desync — acceptable for the short sessions here.
         video_in = [
             "-f", "rawvideo",
             "-vcodec", "rawvideo",

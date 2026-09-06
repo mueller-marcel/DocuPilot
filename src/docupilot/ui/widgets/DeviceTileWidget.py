@@ -4,7 +4,10 @@ from PySide6.QtWidgets import QFrame, QLabel, QPushButton, QSizePolicy, QVBoxLay
 
 class DeviceTileWidget(QPushButton):
     """
-    Represents a clickable QPushButton as a tile widget for a specific device with preview, name, and details.
+    A checkable tile for one device: a preview, a name and a detail line.
+
+    The represented device is reachable as `.device` and, for the subclasses'
+    readers, also under the name they chose (`.screen`, `.microphone`).
     """
 
     def __init__(
@@ -17,18 +20,17 @@ class DeviceTileWidget(QPushButton):
         parent: QWidget | None = None,
     ) -> None:
         """
-        Initialize the generic device tile widget.
-
         :param device: The represented device object.
-        :param device_attr_name: Name of the public attribute that stores the device (for example, "screen" or "microphone").
+        :param device_attr_name: Name of the public attribute that also stores the
+            device (for example, "screen" or "microphone").
         :param preview_widget: Widget shown in the preview area.
         :param name_text: Main title text of the tile.
         :param details_text: Secondary detail text of the tile.
         :param parent: Parent widget.
         """
-
         super().__init__(parent)
 
+        self.device = device
         setattr(self, device_attr_name, device)
 
         self.setCheckable(True)
@@ -64,38 +66,38 @@ class DeviceTileWidget(QPushButton):
         self.setStyleSheet(
             """
             QPushButton {
-                background-color: #2b2b2b;
-                border: 2px solid #555555;
+                background-color: #ffffff;
+                border: 2px solid #cccccc;
                 border-radius: 12px;
-                color: white;
+                color: #222222;
                 text-align: left;
             }
 
             QPushButton:hover {
-                border: 2px solid #888888;
-                background-color: #333333;
+                border: 2px solid #999999;
+                background-color: #f5f5f5;
             }
 
             QPushButton:checked {
                 border: 3px solid #4da3ff;
-                background-color: #3a3f46;
+                background-color: #e8f0fe;
             }
 
             QFrame#previewFrame {
-                background-color: #1e1e1e;
-                border: 1px solid #444444;
+                background-color: #f0f0f0;
+                border: 1px solid #dddddd;
                 border-radius: 8px;
             }
 
             QLabel#deviceNameLabel {
                 font-size: 14px;
                 font-weight: 600;
-                color: white;
+                color: #222222;
             }
 
             QLabel#deviceDetailsLabel {
                 font-size: 12px;
-                color: #d0d0d0;
+                color: #666666;
             }
             """
         )

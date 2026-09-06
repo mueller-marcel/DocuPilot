@@ -1,14 +1,15 @@
 from __future__ import annotations
 
 from PySide6.QtCore import QRectF, Qt
-from PySide6.QtGui import QColor, QFont, QPainter, QPen
+from PySide6.QtGui import QColor, QPainter, QPen
 from PySide6.QtWidgets import QWidget
 
-_BACKGROUND = "#1e1e2e"
-_TEXT = "#ddd"
-_MUTED = "#888"
-_ABSENT = "#3a3a4e"
-_CHANCE = "#f87171"
+from docupilot.ui.widgets.chart_style import (
+    BACKGROUND, TEXT, paint_placeholder, small_fonts,
+)
+
+_ABSENT = "#d0d0d8"
+_CHANCE = "#dc2626"
 
 _DOT_SPACING = 26
 _DOT_RADIUS = 6
@@ -33,7 +34,7 @@ class SubsetChartWidget(QWidget):
         self._rows: list[tuple[frozenset[str], float, float, float]] = []
         self._chance: float | None = None
         self.setMinimumHeight(200)
-        self.setStyleSheet(f"background:{_BACKGROUND};")
+        self.setStyleSheet(f"background:{BACKGROUND};")
 
     def set_values(
         self,
@@ -58,13 +59,11 @@ class SubsetChartWidget(QWidget):
     def paintEvent(self, event) -> None:
         painter = QPainter(self)
         painter.setRenderHint(QPainter.RenderHint.Antialiasing)
-        painter.fillRect(self.rect(), QColor(_BACKGROUND))
 
         if not self._rows:
-            painter.setPen(QColor(_MUTED))
-            painter.drawText(self.rect(), Qt.AlignmentFlag.AlignCenter,
-                             "Noch keine Auswertung")
+            paint_placeholder(painter, self.rect())
             return
+        painter.fillRect(self.rect(), QColor(BACKGROUND))
 
         dots_width = _DOT_SPACING * len(self._modalities) + 14
         plot_left = dots_width + 10
@@ -72,15 +71,12 @@ class SubsetChartWidget(QWidget):
         span = plot_right - plot_left
         top_offset = 24
 
-        small = QFont(self.font())
-        small.setPointSize(9)
-        tiny = QFont(small)
-        tiny.setPointSize(8)
+        small, tiny = small_fonts(self.font())
 
         # Column header: which dot belongs to which modality.
         painter.setFont(tiny)
         for column, modality in enumerate(self._modalities):
-            painter.setPen(QColor(self._colors.get(modality, _TEXT)))
+            painter.setPen(QColor(self._colors.get(modality, TEXT)))
             painter.drawText(
                 QRectF(7 + column * _DOT_SPACING - 10, 2, _DOT_SPACING + 20, 16),
                 int(Qt.AlignmentFlag.AlignHCenter),
@@ -96,7 +92,7 @@ class SubsetChartWidget(QWidget):
                 present = modality in subset
                 painter.setPen(Qt.PenStyle.NoPen)
                 painter.setBrush(
-                    QColor(self._colors.get(modality, _TEXT)) if present
+                    QColor(self._colors.get(modality, TEXT)) if present
                     else QColor(_ABSENT)
                 )
                 painter.drawEllipse(
@@ -111,7 +107,7 @@ class SubsetChartWidget(QWidget):
                 if subset else QColor(_ABSENT)
             )
             painter.setPen(Qt.PenStyle.NoPen)
-            painter.setBrush(tint.darker(150))
+            painter.setBrush(tint.lighter(135))
             painter.drawRoundedRect(
                 QRectF(plot_left, middle - 7, max(span * value, 1.0), 14), 3, 3
             )
@@ -121,7 +117,7 @@ class SubsetChartWidget(QWidget):
                              int(plot_left + span * ci_high), int(middle))
 
             painter.setFont(small)
-            painter.setPen(QColor(_TEXT))
+            painter.setPen(QColor(TEXT))
             painter.drawText(
                 QRectF(plot_right + 8, top, _VALUE_WIDTH - 12, _ROW_HEIGHT),
                 int(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter),

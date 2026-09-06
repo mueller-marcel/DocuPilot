@@ -12,10 +12,12 @@ import json
 import os
 import re
 from dataclasses import dataclass
-from pathlib import Path
 
 import numpy as np
 
+from docupilot.segmentation import backend
+
+# backend's import loaded .env, so the variable is visible here.
 MODEL = os.environ.get("DOCUPILOT_AUDIO_MODEL", "claude-opus-4-8")
 
 # Bump when the prompt or the score mapping changes — invalidates cached verdicts.
@@ -101,62 +103,17 @@ class Judgement:
     p_boundary: float   # graded evidence in [0, 1]
     reason: str = ""
 
-    @property
-    def is_boundary(self) -> bool:
-        return self.category == _BOUNDARY
 
+# The one boundary decision rule lives downstream (BOUNDARY_THRESHOLD on
+# p_boundary) — deliberately no category-based second rule here.
 
-def _load_dotenv() -> None:
-    """Read the project's .env (see video_scoring for how the root is found)."""
-    root = next(
-        (d for d in Path(__file__).resolve().parents if (d / "pyproject.toml").exists()),
-        None,
-    )
-    if root is None:
-        return
-    env_file = root / ".env"
-    if not env_file.exists():
-        return
-    try:
-        for line in env_file.read_text(encoding="utf-8-sig").splitlines():
-            line = line.strip()
-            if not line or line.startswith("#") or "=" not in line:
-                continue
-            key, _, value = line.partition("=")
-            os.environ.setdefault(key.strip(), value.strip().strip('"').strip("'"))
-    except OSError:
-        pass
-
-
-_load_dotenv()
-_CLIENT = None
-
-
-def _client():
-    global _CLIENT
-    if _CLIENT is None:
-        import anthropic
-        _CLIENT = anthropic.Anthropic()
-    return _CLIENT
-
-
-def is_available() -> bool:
-    """True iff the LLM can actually be called right now."""
-    try:
-        import anthropic  # noqa: F401
-    except ImportError:
-        return False
-    try:
-        client = _client()
-    except Exception:
-        return False
-    return bool(getattr(client, "api_key", None) or getattr(client, "auth_token", None))
+is_available = backend.is_available
 
 
 def ask(sentences: list[str], model: str = MODEL) -> str:
     """Send the whole narration in ONE call so each sentence is judged in context."""
     numbered = "\n".join(f"[{i}] {s}" for i, s in enumerate(sentences))
-    message = _client().messages.create(
+    message = backend.client().messages.create(
         model=model,
         max_tokens=8000,
         system=_SYSTEM,
@@ -212,17 +169,8 @@ def parse(raw: str, n: int) -> list[Judgement] | None:
     return [by_index.get(i, Judgement("OTHER", 0.0, "kein Urteil")) for i in range(n)]
 
 
-class Cache:
-    """Verdicts cached beside the recording, keyed on the transcript content."""
-
-    def __init__(self, path: Path) -> None:
-        self._path = path
-        self._entries: dict[str, list] = {}
-        if path.exists():
-            try:
-                self._entries = json.loads(path.read_text(encoding="utf-8"))
-            except (OSError, json.JSONDecodeError):
-                pass
+class Cache(backend.JsonVerdictCache):
+    """Verdict sets keyed on the transcript content, model and prompt version."""
 
     @staticmethod
     def key(sentences: list[str], model: str) -> str:
@@ -231,7 +179,7 @@ class Cache:
         return h.hexdigest()
 
     def get(self, key: str) -> list[Judgement] | None:
-        raw = self._entries.get(key)
+        raw = self._raw(key)
         if not isinstance(raw, list):
             return None
         try:
@@ -241,19 +189,10 @@ class Cache:
             return None
 
     def put(self, key: str, js: list[Judgement]) -> None:
-        self._entries[key] = [
+        self._store(key, [
             {"category": j.category, "p_boundary": j.p_boundary, "reason": j.reason}
             for j in js
-        ]
-
-    def flush(self) -> None:
-        try:
-            self._path.parent.mkdir(parents=True, exist_ok=True)
-            self._path.write_text(
-                json.dumps(self._entries, ensure_ascii=False, indent=1), encoding="utf-8"
-            )
-        except OSError:
-            pass
+        ])
 
 
 def judge(sentences: list[str], cache: Cache | None = None,
