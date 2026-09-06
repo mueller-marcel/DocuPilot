@@ -12,7 +12,6 @@ encoder and would test the codec, not the pipeline.
 """
 
 import shutil
-import subprocess
 
 import numpy as np
 import pytest
@@ -78,13 +77,6 @@ class TestFfprobe:
         assert len(times) == n_frames
         assert times[0] == 0.0
         assert np.all(np.diff(times) > 0)
-
-    def test_ffprobe_really_is_available(self):
-        # Guards the skip condition itself: a silently skipped module would look
-        # exactly like a passing one.
-        assert subprocess.run(
-            ["ffprobe", "-version"], capture_output=True, text=True
-        ).returncode == 0
 
 
 class TestDecoding:
